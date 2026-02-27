@@ -76,6 +76,7 @@ export interface ProjectionTextBox {
   centerAnchor?: string;
   isDup?: boolean;
   rendered?: boolean;
+  isMarginLineNumber?: boolean;
   shouldSpace?: number;
   forceUnsnapped?: boolean;
   rotated?: boolean;

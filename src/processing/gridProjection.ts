@@ -664,7 +664,8 @@ function handleRotationReadingOrder(textBbox: ProjectionTextBox[], pageHeight: n
 export function bboxToLine(
   textBbox: ProjectionTextBox[],
   medianWidth: number,
-  medianHeight: number
+  medianHeight: number,
+  pageWidth?: number
 ): ProjectionTextBox[][] {
   // Y-tolerance for sorting: items within this threshold are considered same line
   // This handles floating point precision issues between columns (e.g., 334.7400 vs 334.7399)
@@ -672,6 +673,28 @@ export function bboxToLine(
 
   // Note: We keep whitespace items as they may be needed for proper word separation.
   // The spacing calculation handles gaps between items.
+
+  // For two-column documents, detect and mark margin line numbers
+  // These are short numeric items positioned between columns (near the page midpoint)
+  // They should not be merged with column content
+  if (pageWidth) {
+    const midpoint = pageWidth * 0.5;
+    const marginZoneLeft = midpoint - 5;
+    const marginZoneRight = midpoint + 20;
+    for (const bbox of textBbox) {
+      const bboxCenter = bbox.x + bbox.w / 2;
+      // Check if item is in the margin zone and looks like a line number
+      if (
+        bboxCenter > marginZoneLeft &&
+        bboxCenter < marginZoneRight &&
+        bbox.str.trim().match(/^\d{1,2}[O]?$/) && // 1-2 digits, possibly with O (OCR error for 0)
+        bbox.w < 15 // Line numbers are narrow
+      ) {
+        // Mark as margin item - will be placed on its own line
+        bbox.isMarginLineNumber = true;
+      }
+    }
+  }
 
   // sort lines on first y axis then x axis (top - left)
   // Use Y tolerance so items on same visual line sort by x regardless of tiny y differences
@@ -755,14 +778,22 @@ export function bboxToLine(
         const overlapLenght =
           Math.min(currentLineItemBbox.x + currentLineItemBbox.w, bbox.x + bbox.w) -
           Math.max(currentLineItemBbox.x, bbox.x);
-        if (overlapLenght > medianWidth / 3) {
+        // Use a minimum threshold of 3px to tolerate small overlaps common in PDFs
+        // due to character spacing/kerning, while still detecting true collisions
+        if (overlapLenght > Math.max(medianWidth / 3, 3)) {
           lineCollide = true;
           break;
         }
       }
 
+      // Don't merge margin line numbers with regular content
+      const currentLineHasMargin = currentLine.some((b) => b.isMarginLineNumber === true);
+      const bboxIsMargin = bbox.isMarginLineNumber === true;
+      const marginMismatch = currentLineHasMargin !== bboxIsMargin;
+
       if (
         !lineCollide &&
+        !marginMismatch &&
         ((bbox.y + bbox.h * 0.5 >= lineMinY && bbox.y + bbox.h * 0.5 <= lineMaxY) ||
           (bbox.y >= lineMinY && bbox.y <= lineMaxY))
       ) {
@@ -1028,7 +1059,7 @@ export function projectToGrid(
   }
 
   handleRotationReadingOrder(projectionBoxes, page.height);
-  const lines = bboxToLine(projectionBoxes, medianWidth, medianHeight);
+  const lines = bboxToLine(projectionBoxes, medianWidth, medianHeight, page.width);
 
   // remove unprojectable text and apply markup to final lines
   for (let i = 0; i < lines.length; ++i) {
