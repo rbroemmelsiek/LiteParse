@@ -93,6 +93,27 @@ const BUGGY_FONT_MARKER_CHECK = ":->|>";
 const PIPE_PATTERN_REGEX = /\s*\|([^|])\|\s*/g;
 
 /**
+ * Strip C0/C1 control characters from text (except common whitespace).
+ * These can appear in PDF text due to font encoding issues but the
+ * surrounding text may still be valid.
+ */
+function stripControlChars(str: string): string {
+  let result = "";
+  for (const char of str) {
+    const code = char.charCodeAt(0);
+    // Skip C0 controls (except tab, newline, carriage return) and C1 controls
+    if (
+      (code >= 0x00 && code <= 0x1f && code !== 0x09 && code !== 0x0a && code !== 0x0d) ||
+      (code >= 0x80 && code <= 0x9f)
+    ) {
+      continue;
+    }
+    result += char;
+  }
+  return result;
+}
+
+/**
  * Detect garbled text from fonts with corrupted ToUnicode mappings.
  *
  * When PDF fonts lack proper ToUnicode maps, PDF.js may output characters
@@ -101,7 +122,7 @@ const PIPE_PATTERN_REGEX = /\s*\|([^|])\|\s*/g;
  * 1. Private Use Area (PUA) characters - fonts often map glyphs here
  * 2. Mix of unrelated scripts (Arabic + Latin Extended in English text)
  * 3. Rare/obscure Unicode blocks appearing in normal text
- * 4. Control characters or specials
+ * 4. Control characters (when text is predominantly control chars)
  *
  * Returns true if the string appears to be garbled font output.
  */
@@ -113,12 +134,22 @@ function isGarbledFontOutput(str: string): boolean {
   let latinExtendedCount = 0;
   let basicLatinLetterCount = 0;
   let suspiciousCount = 0; // Other suspicious Unicode ranges
+  let controlCharCount = 0; // C0/C1 control characters
+  let normalCharCount = 0; // Normal printable characters
 
   for (const char of str) {
     const code = char.charCodeAt(0);
 
+    // C0 control characters (0x00-0x1F) except common whitespace (tab, newline, carriage return)
+    // C1 control characters (0x80-0x9F)
+    if (
+      (code >= 0x00 && code <= 0x1f && code !== 0x09 && code !== 0x0a && code !== 0x0d) ||
+      (code >= 0x80 && code <= 0x9f)
+    ) {
+      controlCharCount++;
+    }
     // Private Use Area (U+E000-U+F8FF) - almost always garbled
-    if (code >= 0xe000 && code <= 0xf8ff) {
+    else if (code >= 0xe000 && code <= 0xf8ff) {
       privateUseCount++;
     }
     // Arabic block (0x600-0x6FF) and Arabic Extended (0x750-0x77F, 0x8A0-0x8FF)
@@ -137,6 +168,7 @@ function isGarbledFontOutput(str: string): boolean {
     // Basic Latin letters (a-z, A-Z)
     else if ((code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a)) {
       basicLatinLetterCount++;
+      normalCharCount++;
     }
     // Suspicious ranges that rarely appear in normal text:
     // - Syriac (0x700-0x74F)
@@ -156,9 +188,19 @@ function isGarbledFontOutput(str: string): boolean {
     ) {
       suspiciousCount++;
     }
+    // Normal printable characters (digits, punctuation, common symbols, space)
+    else if ((code >= 0x20 && code <= 0x7e) || code === 0x09 || code === 0x0a || code === 0x0d) {
+      normalCharCount++;
+    }
   }
 
   const totalChars = str.length;
+
+  // Text is predominantly control characters - definitely garbled
+  // This catches cases like more_hard_2.pdf where text is entirely control chars
+  if (controlCharCount > 0 && controlCharCount > normalCharCount) {
+    return true;
+  }
 
   // Private Use Area characters are almost always garbled fonts
   if (privateUseCount >= 2) {
@@ -302,6 +344,10 @@ export class PdfJsEngine implements PdfEngine {
         garbledTextRegions.push({ x: left, y: top, width, height });
         continue;
       }
+
+      // Strip any remaining control characters from valid text
+      // (e.g., form feed chars that sneak into ligatures like "fi")
+      decodedStr = stripControlChars(decodedStr);
 
       textItems.push({
         str: decodedStr,

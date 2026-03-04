@@ -511,43 +511,52 @@ function handleRotationReadingOrder(textBbox: ProjectionTextBox[], pageHeight: n
     return;
   }
 
-  textBbox.sort((a, b) => {
-    return a.x - b.x;
-  });
-
-  // Horizontal Axis
-  let bboxGroup: ProjectionTextBox[][] = [];
-  let currentGroup: ProjectionTextBox[] = [];
-  let previousBbox: ProjectionTextBox | null = null;
+  // Group ALL items by rotation value (not by consecutive items)
+  // This ensures rotated text blocks stay together even when their X coordinates
+  // overlap with non-rotated content (e.g., rotated table + footer at same X positions)
+  const groupsByRotation: { [key: number]: ProjectionTextBox[] } = {};
   for (const bbox of textBbox) {
-    if (previousBbox) {
-      if (bbox.r == previousBbox.r) {
-        currentGroup.push(bbox);
-      } else {
-        // sort currentGroup by bbox.y
-        currentGroup.sort((a, b) => a.y - b.y);
-        bboxGroup.push(currentGroup);
-        currentGroup = [bbox];
-      }
-    } else {
-      currentGroup.push(bbox);
+    const r = bbox.r || 0;
+    if (!groupsByRotation[r]) {
+      groupsByRotation[r] = [];
     }
-    previousBbox = bbox;
+    groupsByRotation[r].push(bbox);
   }
-  if (currentGroup.length) {
-    currentGroup.sort((a, b) => a.y - b.y);
-    bboxGroup.push(currentGroup);
+
+  // Build bboxGroup array from rotation groups, sorted by X position of group
+  const bboxGroup: ProjectionTextBox[][] = [];
+  for (const rotation in groupsByRotation) {
+    const group = groupsByRotation[rotation];
+    // Sort each group by Y for proper reading order
+    group.sort((a, b) => a.y - b.y);
+    bboxGroup.push(group);
   }
+
+  // Sort groups by their minimum X position to maintain left-to-right order
+  bboxGroup.sort((a, b) => {
+    const minXA = Math.min(...a.map((item) => item.x));
+    const minXB = Math.min(...b.map((item) => item.x));
+    return minXA - minXB;
+  });
 
   // NOTE/ WARNING: height and width of bbox are NOT rotated beforehand!
   for (const [index, group] of bboxGroup.entries()) {
     if (group[0].r == 90 || group[0].r == 270) {
-      // check in all bbox if they are not group[0].r and have overlap in x axis
+      // Check if there are non-rotated items that actually overlap visually (both X and Y)
+      // with the rotated group. X-only overlap is not sufficient because items could
+      // be in completely different parts of the page (e.g., rotated table + footer).
       let globalOverlap = false;
       for (const bbox of textBbox) {
         if (bbox.r != group[0].r) {
           const overlap = group.find(
-            (b) => b.x >= bbox.x && b.x <= bbox.x + bbox.w && bbox.r != b.r
+            (b) =>
+              // Check X overlap
+              b.x >= bbox.x &&
+              b.x <= bbox.x + bbox.w &&
+              // Also check Y overlap - items must actually be near each other vertically
+              b.y < bbox.y + bbox.h &&
+              b.y + b.h > bbox.y &&
+              bbox.r != b.r
           );
           if (overlap) {
             globalOverlap = true;
@@ -565,7 +574,7 @@ function handleRotationReadingOrder(textBbox: ProjectionTextBox[], pageHeight: n
           bbox.r = 0;
           bbox.rotated = true;
         }
-      } else if (!globalOverlap) {
+      } else {
         // insert the bbox group in the Y axis after previous group and before next group.
         // move Next group by current group height (width as not rotated yet).
         const groupMaxX = Math.max(...group.map((v) => v.x + v.w));
@@ -577,25 +586,52 @@ function handleRotationReadingOrder(textBbox: ProjectionTextBox[], pageHeight: n
           // pageHeight is radical but garantie no issue of allignement
           deltaY = previousGroupMaxY + pageHeight;
         }
-        // clockwize rotation
+        // clockwise rotation (90 degrees)
+        // - Text reads top-to-bottom in page space
+        // - Y position in page space -> X position after de-rotation
+        // - X position in page space -> Y position after de-rotation (row)
         if (group[0].r == 90) {
           for (const bbox of group) {
-            // w not h here as bbox w/h are not flipped
-            const x = Math.round(bbox.ry ?? bbox.y);
-            const y = (bbox.rx ?? bbox.x) + deltaY;
-            bbox.x = Math.round(x);
-            bbox.y = y;
+            const newX = Math.round(bbox.y);
+            const newY = bbox.x + deltaY;
+            // Swap width and height since text orientation changes
+            const newW = bbox.h;
+            const newH = bbox.w;
+            bbox.x = newX;
+            bbox.y = newY;
+            bbox.w = newW;
+            bbox.h = newH;
             bbox.r = 0;
             bbox.rotated = true;
           }
         }
-        // counter clockwize rotation
+        // counter clockwize rotation (text reads bottom-to-top)
+        // For 270-degree rotation, text at higher Y positions should be
+        // at lower X positions after de-rotation (left-to-right reading order)
         if (group[0].r == 270) {
+          // For 270-degree counter-clockwise rotation:
+          // - Text reads bottom-to-top in page space
+          // - Y position in page space -> X position after de-rotation (inverted)
+          // - X position in page space -> Y position after de-rotation (row)
+          // - w and h need to be swapped since they represent visual dimensions
+          // For 270-degree rotation: h is the extent along reading direction (string width)
+          const maxY = Math.max(...group.map((b) => b.y + b.h));
+
           for (const bbox of group) {
-            const x = Math.round(bbox.ry ?? bbox.y);
-            const y = (bbox.rx ?? bbox.x) + deltaY;
-            bbox.x = Math.round(x);
-            bbox.y = y;
+            // Transform coordinates:
+            // - new_x = distance from right edge of rotated block (inverted Y)
+            //   Use h (string width in original coords) for the extent
+            // - new_y = row position (from original X)
+            const newX = Math.round(maxY - bbox.y - bbox.h);
+            // Use exact X for Y (will be grouped by bboxToLine's Y_SORT_TOLERANCE)
+            const newY = bbox.x + deltaY;
+            // Swap width and height since text orientation changes
+            const newW = bbox.h;
+            const newH = bbox.w;
+            bbox.x = newX;
+            bbox.y = newY;
+            bbox.w = newW;
+            bbox.h = newH;
             bbox.r = 0;
             bbox.rotated = true;
           }
@@ -624,32 +660,12 @@ function handleRotationReadingOrder(textBbox: ProjectionTextBox[], pageHeight: n
     return a.y - b.y;
   });
 
-  // Vertical Axis
-  bboxGroup = [];
-  currentGroup = [];
-  previousBbox = null as ProjectionTextBox | null;
-  for (const bbox of textBbox) {
-    if (previousBbox) {
-      if (bbox.r == previousBbox.r) {
-        currentGroup.push(bbox);
-      } else {
-        // sort currentGroup by bbox.y
-        currentGroup.sort((a, b) => a.x - b.x);
-        bboxGroup.push(currentGroup);
-        currentGroup = [bbox];
-      }
-    } else {
-      currentGroup.push(bbox);
-    }
-    previousBbox = bbox;
-  }
-  if (currentGroup.length) {
-    currentGroup.sort((a, b) => a.x - b.x);
-    bboxGroup.push(currentGroup);
-  }
-
+  // Handle 180-degree rotated text (upside down)
+  // Since we already grouped by rotation, we can iterate the existing groups
   for (const group of bboxGroup) {
     if (group[0].r == 180) {
+      // Sort by X for proper reading order
+      group.sort((a, b) => a.x - b.x);
       // Switch upside down
       for (const bbox of group) {
         bbox.x = Math.round(bbox.ry ?? bbox.y);
@@ -668,8 +684,11 @@ export function bboxToLine(
   pageWidth?: number
 ): ProjectionTextBox[][] {
   // Y-tolerance for sorting: items within this threshold are considered same line
-  // This handles floating point precision issues between columns (e.g., 334.7400 vs 334.7399)
-  const Y_SORT_TOLERANCE = 2.0;
+  // This handles:
+  // 1. Floating point precision issues between columns (e.g., 334.7400 vs 334.7399)
+  // 2. Subscripts/superscripts which are typically offset by 3-5 units from their base characters
+  // Using a fraction of medianHeight to scale with document font size.
+  const Y_SORT_TOLERANCE = Math.max(medianHeight * 0.5, 5.0);
 
   // Note: We keep whitespace items as they may be needed for proper word separation.
   // The spacing calculation handles gaps between items.
@@ -778,9 +797,12 @@ export function bboxToLine(
         const overlapLenght =
           Math.min(currentLineItemBbox.x + currentLineItemBbox.w, bbox.x + bbox.w) -
           Math.max(currentLineItemBbox.x, bbox.x);
-        // Use a minimum threshold of 3px to tolerate small overlaps common in PDFs
-        // due to character spacing/kerning, while still detecting true collisions
-        if (overlapLenght > Math.max(medianWidth / 3, 3)) {
+        // Use a minimum threshold to tolerate small overlaps common in PDFs due to:
+        // - character spacing/kerning
+        // - floating-point precision issues
+        // - adjacent items with slightly overlapping bounding boxes
+        // We want to detect true collisions (same text rendered twice) not adjacent text
+        if (overlapLenght > Math.max(medianWidth / 3, 5)) {
           lineCollide = true;
           break;
         }
@@ -791,10 +813,15 @@ export function bboxToLine(
       const bboxIsMargin = bbox.isMarginLineNumber === true;
       const marginMismatch = currentLineHasMargin !== bboxIsMargin;
 
+      // For rotated text, use Y-tolerance based merging since heights may be inconsistent
+      const yTolerance = bbox.rotated ? Math.max(medianHeight * 2, 20) : 0;
+      const yWithinTolerance = bbox.rotated && Math.abs(bbox.y - lineMinY) < yTolerance;
+
       if (
         !lineCollide &&
         !marginMismatch &&
-        ((bbox.y + bbox.h * 0.5 >= lineMinY && bbox.y + bbox.h * 0.5 <= lineMaxY) ||
+        (yWithinTolerance ||
+          (bbox.y + bbox.h * 0.5 >= lineMinY && bbox.y + bbox.h * 0.5 <= lineMaxY) ||
           (bbox.y >= lineMinY && bbox.y <= lineMaxY))
       ) {
         currentLine.push(bbox);
