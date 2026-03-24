@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "liteparse"
-version = "1.0.0"
+version = "1.0.1"
 description = "Python wrapper for LiteParse - fast, lightweight PDF and document parsing"
 readme = "README.md"
 license = "MIT"
@@ -48,6 +48,3 @@ python_version = "3.10"
 strict = true
 warn_return_any = true
 warn_unused_ignores = true
-
-[tool.pytest.ini_options]
-asyncio_mode = "auto"

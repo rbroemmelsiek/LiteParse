@@ -61,14 +61,11 @@ def _parse_json_result(json_data: dict) -> ParseResult:
         for item in page_data.get("textItems", []):
             text_items.append(
                 TextItem(
-                    str=item.get("str", ""),
+                    text=item.get("text", ""),
                     x=item.get("x", 0),
                     y=item.get("y", 0),
                     width=item.get("width", 0),
                     height=item.get("height", 0),
-                    w=item.get("w", 0),
-                    h=item.get("h", 0),
-                    r=item.get("r", 0),
                     fontName=item.get("fontName"),
                     fontSize=item.get("fontSize"),
                 )
@@ -111,12 +108,13 @@ def _build_parse_cli_args(
     ocr_enabled: bool,
     ocr_server_url: Optional[str],
     ocr_language: str,
+    num_workers: Optional[int],
     max_pages: int,
     target_pages: Optional[str],
     dpi: int,
     precise_bounding_box: bool,
-    skip_diagonal_text: bool,
     preserve_very_small_text: bool,
+    password: Optional[str],
 ) -> List[str]:
     """Build CLI arguments for parse command."""
     args: List[str] = ["--format", "json"]
@@ -127,6 +125,10 @@ def _build_parse_cli_args(
         args.extend(["--ocr-server-url", ocr_server_url])
 
     args.extend(["--ocr-language", ocr_language])
+
+    if num_workers is not None:
+        args.extend(["--num-workers", str(num_workers)])
+
     args.extend(["--max-pages", str(max_pages)])
 
     if target_pages:
@@ -137,11 +139,11 @@ def _build_parse_cli_args(
     if not precise_bounding_box:
         args.append("--no-precise-bbox")
 
-    if skip_diagonal_text:
-        args.append("--skip-diagonal-text")
-
     if preserve_very_small_text:
         args.append("--preserve-small-text")
+
+    if password:
+        args.extend(["--password", password])
 
     args.append("-q")
     return args
@@ -152,11 +154,13 @@ def _build_batch_cli_args(
     ocr_enabled: bool,
     ocr_server_url: Optional[str],
     ocr_language: str,
+    num_workers: Optional[int],
     max_pages: int,
     dpi: int,
     precise_bounding_box: bool,
     recursive: bool,
     extension_filter: Optional[str],
+    password: Optional[str],
 ) -> List[str]:
     """Build CLI arguments for batch-parse command."""
     args: List[str] = ["--format", output_format.value]
@@ -167,6 +171,10 @@ def _build_batch_cli_args(
         args.extend(["--ocr-server-url", ocr_server_url])
 
     args.extend(["--ocr-language", ocr_language])
+
+    if num_workers is not None:
+        args.extend(["--num-workers", str(num_workers)])
+
     args.extend(["--max-pages", str(max_pages)])
     args.extend(["--dpi", str(dpi)])
 
@@ -179,6 +187,10 @@ def _build_batch_cli_args(
     if extension_filter:
         args.extend(["--extension", extension_filter])
 
+    if password:
+        args.extend(["--password", password])
+
+    args.append("-q")
     return args
 
 
@@ -219,12 +231,13 @@ class LiteParse:
         ocr_enabled: bool = True,
         ocr_server_url: Optional[str] = None,
         ocr_language: str = "en",
-        max_pages: int = 1000,
+        num_workers: Optional[int] = None,
+        max_pages: int = 10000,
         target_pages: Optional[str] = None,
         dpi: int = 150,
         precise_bounding_box: bool = True,
-        skip_diagonal_text: bool = False,
         preserve_very_small_text: bool = False,
+        password: Optional[str] = None,
         timeout: Optional[float] = None,
     ) -> ParseResult:
         """
@@ -235,14 +248,14 @@ class LiteParse:
             ocr_enabled: Whether to enable OCR for scanned documents
             ocr_server_url: URL of HTTP OCR server (uses Tesseract if not provided)
             ocr_language: Language code for OCR (e.g., "en", "fr", "de")
+            num_workers: Number of pages to OCR in parallel (defaults to CPU cores - 1)
             max_pages: Maximum number of pages to parse
             target_pages: Specific pages to parse (e.g., "1-5,10,15-20")
             dpi: DPI for rendering (affects OCR quality)
             precise_bounding_box: Whether to compute precise bounding boxes
-            skip_diagonal_text: Whether to skip diagonal text
             preserve_very_small_text: Whether to preserve very small text
+            password: Password for encrypted/protected documents
             timeout: Timeout in seconds (None for no timeout)
-            quiet: Whether to suppress CLI output (overrides -q flag)
 
         Returns:
             ParseResult containing the parsed document data
@@ -264,12 +277,13 @@ class LiteParse:
                 ocr_enabled=ocr_enabled,
                 ocr_server_url=ocr_server_url,
                 ocr_language=ocr_language,
+                num_workers=num_workers,
                 max_pages=max_pages,
                 target_pages=target_pages,
                 dpi=dpi,
                 precise_bounding_box=precise_bounding_box,
-                skip_diagonal_text=skip_diagonal_text,
                 preserve_very_small_text=preserve_very_small_text,
+                password=password,
             )
         )
 
@@ -306,11 +320,13 @@ class LiteParse:
         ocr_enabled: bool = True,
         ocr_server_url: Optional[str] = None,
         ocr_language: str = "en",
-        max_pages: int = 1000,
+        num_workers: Optional[int] = None,
+        max_pages: int = 10000,
         dpi: int = 150,
         precise_bounding_box: bool = True,
         recursive: bool = False,
         extension_filter: Optional[str] = None,
+        password: Optional[str] = None,
         timeout: Optional[float] = None,
     ) -> BatchResult:
         """
@@ -326,11 +342,13 @@ class LiteParse:
             ocr_enabled: Whether to enable OCR for scanned documents
             ocr_server_url: URL of HTTP OCR server (uses Tesseract if not provided)
             ocr_language: Language code for OCR
+            num_workers: Number of pages to OCR in parallel (defaults to CPU cores - 1)
             max_pages: Maximum number of pages to parse per file
             dpi: DPI for rendering
             precise_bounding_box: Whether to compute precise bounding boxes
             recursive: Whether to recursively search subdirectories
             extension_filter: Only process files with this extension (e.g., ".pdf")
+            password: Password for encrypted/protected documents (applied to all files)
             timeout: Timeout in seconds for the entire batch
 
         Returns:
@@ -362,11 +380,13 @@ class LiteParse:
                 ocr_enabled=ocr_enabled,
                 ocr_server_url=ocr_server_url,
                 ocr_language=ocr_language,
+                num_workers=num_workers,
                 max_pages=max_pages,
                 dpi=dpi,
                 precise_bounding_box=precise_bounding_box,
                 recursive=recursive,
                 extension_filter=extension_filter,
+                password=password,
             )
         )
 
@@ -392,6 +412,7 @@ class LiteParse:
         target_pages: Optional[str] = None,
         dpi: int = 150,
         image_format: Union[ImageFormat, str] = ImageFormat.PNG,
+        password: Optional[str] = None,
         load_bytes: bool = False,
         timeout: Optional[float] = None,
     ) -> ScreenshotBatchResult:
@@ -404,6 +425,7 @@ class LiteParse:
             target_pages: Specific pages to screenshot (e.g., "1,3,5" or "1-5")
             dpi: DPI for rendering
             image_format: Image format ("png" or "jpg")
+            password: Password for encrypted/protected documents
             load_bytes: If True, load image bytes into ScreenshotResult objects
             timeout: Timeout in seconds
 
@@ -441,6 +463,9 @@ class LiteParse:
 
         if target_pages:
             cmd.extend(["--target-pages", target_pages])
+
+        if password:
+            cmd.extend(["--password", password])
 
         try:
             result = subprocess.run(

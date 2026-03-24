@@ -29,14 +29,11 @@ class BoundingBox:
 @dataclass
 class TextItem:
     """Individual text item extracted from a document."""
-    str: str
+    text: str
     x: float
     y: float
     width: float
     height: float
-    w: float
-    h: float
-    r: float  # rotation
     fontName: Optional[str] = None
     fontSize: Optional[float] = None
 
