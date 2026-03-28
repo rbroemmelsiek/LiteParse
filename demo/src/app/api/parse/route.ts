@@ -1,5 +1,25 @@
 import { NextRequest, NextResponse } from "next/server";
 import { LiteParse } from "@llamaindex/liteparse";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+export const runtime = "nodejs";
+
+interface TextItem {
+  text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface ParsedPage {
+  page: number;
+  width: number;
+  height: number;
+  textItems: TextItem[];
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -13,10 +33,7 @@ export async function POST(req: NextRequest) {
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    // Save to temp file to completely avoid PDF.js ArrayBuffer detachment bugs in memory
-    const fs = require('fs/promises');
-    const os = require('os');
-    const path = require('path');
+    // Save to temp file to avoid PDF.js ArrayBuffer detachment bugs in memory
     const tempPath = path.join(os.tmpdir(), `liteparse-demo-${Date.now()}.pdf`);
     await fs.writeFile(tempPath, buffer);
 
@@ -47,24 +64,32 @@ export async function POST(req: NextRequest) {
     // Clean up temp file safely
     await fs.unlink(tempPath).catch(console.error);
 
-    // Map the JSON structure to include base64 images
-    const pages = result.json.pages.slice(0, limit).map((pageData) => {
-      const screenshot = screenshots.find(s => s.pageNum === pageData.page);
+    // Map the JSON structure to include raw screenshot images only
+    const pages = (result.json.pages.slice(0, limit) as ParsedPage[]).map((pageData) => {
+      const screenshot = screenshots.find((s) => s.pageNum === pageData.page);
       let imageBase64 = "";
+      let imageWidth = pageData.width;
+      let imageHeight = pageData.height;
       if (screenshot) {
+        imageWidth = screenshot.width || pageData.width;
+        imageHeight = screenshot.height || pageData.height;
         imageBase64 = `data:image/png;base64,${screenshot.imageBuffer.toString("base64")}`;
       }
+
       return {
         ...pageData,
         image: imageBase64,
-        imageWidth: screenshot?.width || pageData.width, // Image width from screenshot buffer
-        imageHeight: screenshot?.height || pageData.height
+        imageWidth,
+        imageHeight,
       };
     });
 
     return NextResponse.json({ pages, text: result.text });
-  } catch (error: any) {
+  } catch (error) {
     console.error("Parse API error:", error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : "Unknown parse error" },
+      { status: 500 },
+    );
   }
 }

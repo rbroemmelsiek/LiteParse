@@ -1,36 +1,50 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# LiteParse Demo App
 
-## Getting Started
+This demo shows a local LiteParse + Gemini workflow:
 
-First, run the development server:
+1. Upload a document and parse it with LiteParse.
+2. Build a template from both extracted text and page screenshots.
+3. Review extracted fields (label, type, source, confidence, bounding box).
+4. Chat with Gemini for follow-up extraction questions against the parsed document and template.
+
+## Run Locally
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
+In-app usage documentation is available at `/help` (top-right Help navigation).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Environment
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Create `.env.local` with:
 
-## Learn More
+```bash
+GEMINI_API_KEY=your_api_key_here
 
-To learn more about Next.js, take a look at the following resources:
+# Model routing
+# Template generation defaults to Gemini 3.1 Pro
+# Extraction/chat defaults to Gemini 3.1 Flash
+# Optional overrides:
+# GEMINI_TEMPLATE_MODEL=gemini-3.1-pro
+# GEMINI_EXTRACTION_MODEL=gemini-3.1-flash
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+# Firebase Admin (server-side)
+FIREBASE_PROJECT_ID=your_project_id
+FIREBASE_CLIENT_EMAIL=firebase-adminsdk-xxx@your-project.iam.gserviceaccount.com
+FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+FIREBASE_STORAGE_BUCKET=your-project.appspot.com
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Notes
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Template generation uses multimodal prompting (text + screenshots).
+- Parse output now also includes visual detections (blank lines, checkboxes, and input-like boxes) derived from screenshots.
+- Each page includes an overlay screenshot with text and visual bounding boxes for QA and debugging.
+- Template matching uses a deterministic document signature.
+- If a matching template exists in the selected library, extraction runs with Gemini 3.1 Flash.
+- If no template exists, the UI prompts to create/save a new template in the selected library.
+- Chat/extraction flows prefer template + text/structure context and do not require screenshots by default.
+- Screenshots are still useful when fields rely on visual cues (blank lines, checkboxes, layout-only form elements).
