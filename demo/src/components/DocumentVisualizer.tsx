@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   UploadCloud,
@@ -97,6 +97,16 @@ type DisplayType =
   | "Progress"
   | "App";
 
+type ReplacementStrength = "light" | "balanced" | "aggressive";
+
+interface FieldReplacementControl {
+  enabled: boolean;
+  strength: ReplacementStrength;
+  xPad: number;
+  yTolerance: number;
+  forceNearestToken: boolean;
+}
+
 interface TemplateField {
   key?: string;
   label: string;
@@ -126,6 +136,12 @@ interface TemplateStaticBlock {
   displayType: "Page Header" | "Section Header" | "Text";
   page: number;
   text: string;
+  bbox?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
 }
 
 interface TemplateDefinition {
@@ -176,7 +192,6 @@ export default function DocumentVisualizer() {
   const [pages, setPages] = useState<PageData[]>([]);
   const [documentText, setDocumentText] = useState("");
   const [analysis, setAnalysis] = useState<string | null>(null);
-  const [instanceJson, setInstanceJson] = useState<Record<string, unknown> | null>(null);
   const [template, setTemplate] = useState<TemplateDefinition | null>(null);
   const [analysisModel, setAnalysisModel] = useState<string | null>(null);
   const [extractionModel, setExtractionModel] = useState<string | null>(null);
@@ -206,9 +221,23 @@ export default function DocumentVisualizer() {
   } | null>(null);
   const [hoveredText, setHoveredText] = useState<string | null>(null);
   const [hoveredItem, setHoveredItem] = useState<{ page: number; text: string } | null>(null);
+  const [selectedStaticBlockIndex, setSelectedStaticBlockIndex] = useState<number | null>(null);
+  const [formTemplatePageTab, setFormTemplatePageTab] = useState<number | "all">("all");
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
+  const [showPreviewOptions, setShowPreviewOptions] = useState(false);
+  const [showPageRefsInPreview, setShowPageRefsInPreview] = useState(true);
+  const [previewMode, setPreviewMode] = useState<"merge-codes" | "sample-values">("merge-codes");
+  const [fieldReplacementControls, setFieldReplacementControls] = useState<
+    Record<string, FieldReplacementControl>
+  >({});
   const [zoom, setZoom] = useState(1);
+  const [hasUserAdjustedZoom, setHasUserAdjustedZoom] = useState(false);
+  const [leftPaneWidthPct, setLeftPaneWidthPct] = useState(58);
+  const [resizingDivider, setResizingDivider] = useState(false);
+  const leftPaneRef = useRef<HTMLDivElement | null>(null);
   const pageOverlayRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const fieldRowRefs = useRef<Record<number, HTMLButtonElement | null>>({});
+  const staticBlockRowRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const [testValues, setTestValues] = useState<Record<string, string>>({});
   const fieldTypes: FieldType[] = [
     "boolean",
@@ -291,26 +320,130 @@ export default function DocumentVisualizer() {
       .replace(/[^a-z0-9]+/g, "_")
       .replace(/^_+|_+$/g, "") || "field";
 
-  const buildStaticBlocksFromPages = (sourcePages: PageData[]): TemplateStaticBlock[] => {
+  const defaultReplacementControl = (
+    partial?: Partial<FieldReplacementControl>,
+  ): FieldReplacementControl => ({
+    enabled: partial?.enabled ?? true,
+    strength: partial?.strength ?? "balanced",
+    xPad: Number.isFinite(partial?.xPad) ? Math.max(0, Number(partial?.xPad)) : 20,
+    yTolerance: Number.isFinite(partial?.yTolerance) ? Math.max(4, Number(partial?.yTolerance)) : 28,
+    forceNearestToken: partial?.forceNearestToken ?? true,
+  });
+
+  const buildStaticBlocksFromPages = (
+    sourcePages: PageData[],
+    fields: TemplateField[] = [],
+    replacementControls: Record<string, FieldReplacementControl> = {},
+  ): TemplateStaticBlock[] => {
     const blocks: TemplateStaticBlock[] = [];
 
     sourcePages.forEach((p) => {
       const rows = [...(p.textItems ?? [])].sort((a, b) => (a.y === b.y ? a.x - b.x : a.y - b.y));
-      const grouped: Array<{ y: number; text: string }> = [];
+      const grouped: Array<{
+        y: number;
+        tokens: Array<{ text: string; x: number; width: number; y: number; height: number }>;
+      }> = [];
       const tol = 5;
       for (const item of rows) {
         const text = item.text?.trim();
         if (!text) continue;
         const target = grouped.find((g) => Math.abs(g.y - item.y) <= tol);
         if (target) {
-          target.text = `${target.text} ${text}`.trim();
+          target.tokens.push({ text, x: item.x, width: item.width, y: item.y, height: item.height });
         } else {
-          grouped.push({ y: item.y, text });
+          grouped.push({
+            y: item.y,
+            tokens: [{ text, x: item.x, width: item.width, y: item.y, height: item.height }],
+          });
+        }
+      }
+
+      const pageFields = fields.filter((f) => f.page === p.page);
+      for (const field of pageFields) {
+        const key = field.key ?? toJsonKey(field.label);
+        const control = defaultReplacementControl(replacementControls[key]);
+        if (!control.enabled) continue;
+        const boxes = getFieldBoxes(field);
+        const mainBox = boxes[0];
+        if (!mainBox) continue;
+        const fieldCy = mainBox.y + mainBox.height / 2;
+        let bestIdx = -1;
+        let bestDist = Number.POSITIVE_INFINITY;
+        grouped.forEach((line, idx) => {
+          const dist = Math.abs(line.y - fieldCy);
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestIdx = idx;
+          }
+        });
+        if (bestIdx === -1 || bestDist > control.yTolerance) continue;
+        const line = grouped[bestIdx];
+        const padByStrength =
+          control.strength === "aggressive" ? 52 : control.strength === "light" ? 8 : 24;
+        const pad = Math.max(control.xPad, padByStrength);
+        const windowLeft = mainBox.x - pad;
+        const windowRight = mainBox.x + mainBox.width + pad;
+        const sortedTokens = [...line.tokens].sort((a, b) => a.x - b.x);
+
+        const beforeCount = line.tokens.length;
+        line.tokens = line.tokens.filter((token) => {
+          const tokenLeft = token.x;
+          const tokenRight = token.x + token.width;
+          const boxLeft = mainBox.x;
+          const boxRight = mainBox.x + mainBox.width;
+          const overlap = Math.min(tokenRight, boxRight) - Math.max(tokenLeft, boxLeft);
+          if (overlap > 0) return false;
+          const tokenCenter = token.x + token.width / 2;
+          return !(tokenCenter >= windowLeft && tokenCenter <= windowRight);
+        });
+
+        if (control.forceNearestToken && line.tokens.length === beforeCount && sortedTokens.length > 0) {
+          let nearestIdx = -1;
+          let nearestDist = Number.POSITIVE_INFINITY;
+          sortedTokens.forEach((token, idx) => {
+            const tokenCenter = token.x + token.width / 2;
+            const dist = Math.abs(tokenCenter - (mainBox.x + mainBox.width / 2));
+            if (dist < nearestDist) {
+              nearestDist = dist;
+              nearestIdx = idx;
+            }
+          });
+          if (nearestIdx >= 0) {
+            const target = sortedTokens[nearestIdx];
+            line.tokens = line.tokens.filter(
+              (token) => !(token.x === target.x && token.width === target.width && token.text === target.text),
+            );
+          }
+        }
+
+        const insertAt = line.tokens.findIndex((token) => token.x > mainBox.x);
+        const placeholder = {
+          text: `{{${key}}}`,
+          x: mainBox.x,
+          width: mainBox.width,
+          y: mainBox.y,
+          height: mainBox.height,
+        };
+        if (insertAt === -1) {
+          line.tokens.push(placeholder);
+        } else {
+          line.tokens.splice(insertAt, 0, placeholder);
         }
       }
 
       grouped.forEach((row, idx) => {
-        const normalized = row.text.replace(/\s+/g, " ").trim();
+        const sortedTokens = row.tokens.sort((a, b) => a.x - b.x);
+        const lineText = sortedTokens
+          .map((t) => t.text)
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (!lineText) return;
+        const normalized = lineText;
+        const minX = Math.min(...sortedTokens.map((t) => t.x));
+        const maxX = Math.max(...sortedTokens.map((t) => t.x + t.width));
+        const minY = Math.min(...sortedTokens.map((t) => t.y));
+        const maxY = Math.max(...sortedTokens.map((t) => t.y + t.height));
         const looksHeader = idx === 0 || /^[A-Z0-9 .,'&()/-]{8,}$/.test(normalized);
         const displayType: TemplateStaticBlock["displayType"] =
           idx === 0 ? "Page Header" : looksHeader ? "Section Header" : "Text";
@@ -319,6 +452,12 @@ export default function DocumentVisualizer() {
           displayType,
           page: p.page,
           text: normalized,
+          bbox: {
+            x: Math.max(0, minX),
+            y: Math.max(0, minY),
+            width: Math.max(1, maxX - minX),
+            height: Math.max(1, maxY - minY),
+          },
         });
       });
     });
@@ -335,7 +474,10 @@ export default function DocumentVisualizer() {
     return {
       ...input,
       fields: normalizedFields,
-      templateContent: input.templateContent ?? { staticBlocks: buildStaticBlocksFromPages(pages) },
+      templateContent:
+        input.templateContent && input.templateContent.staticBlocks?.length > 0
+          ? input.templateContent
+          : { staticBlocks: buildStaticBlocksFromPages(pages, normalizedFields, fieldReplacementControls) },
     };
   };
 
@@ -360,7 +502,7 @@ export default function DocumentVisualizer() {
     }));
   };
 
-  const updateTemplateField = (index: number, updater: (field: TemplateField) => TemplateField) => {
+  const updateTemplateField = useCallback((index: number, updater: (field: TemplateField) => TemplateField) => {
     setTemplate((prev) => {
       if (!prev) return prev;
       if (index < 0 || index >= prev.fields.length) return prev;
@@ -368,25 +510,24 @@ export default function DocumentVisualizer() {
       updatedFields[index] = updater(updatedFields[index]);
       return { ...prev, fields: updatedFields };
     });
-  };
+  }, []);
 
-  const updateTemplateFieldBox = (
-    fieldIndex: number,
-    boxIndex: number,
-    updater: (box: BoxRect) => BoxRect,
-  ) => {
-    updateTemplateField(fieldIndex, (field) => {
-      const boxes = getFieldBoxes(field);
-      if (boxIndex < 0 || boxIndex >= boxes.length) return field;
-      const updated = [...boxes];
-      updated[boxIndex] = normalizeEditableBox(updater(normalizeEditableBox(updated[boxIndex])));
-      return {
-        ...field,
-        bbox: updated[0],
-        bboxes: updated,
-      };
-    });
-  };
+  const updateTemplateFieldBox = useCallback(
+    (fieldIndex: number, boxIndex: number, updater: (box: BoxRect) => BoxRect) => {
+      updateTemplateField(fieldIndex, (field) => {
+        const boxes = getFieldBoxes(field);
+        if (boxIndex < 0 || boxIndex >= boxes.length) return field;
+        const updated = [...boxes];
+        updated[boxIndex] = normalizeEditableBox(updater(normalizeEditableBox(updated[boxIndex])));
+        return {
+          ...field,
+          bbox: updated[0],
+          bboxes: updated,
+        };
+      });
+    },
+    [updateTemplateField],
+  );
 
   useEffect(() => {
     if (!draggingTemplateBox) return;
@@ -419,7 +560,7 @@ export default function DocumentVisualizer() {
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
     };
-  }, [draggingTemplateBox, pages]);
+  }, [draggingTemplateBox, pages, updateTemplateFieldBox]);
 
   useEffect(() => {
     if (selectedFieldIndex === null) return;
@@ -427,6 +568,42 @@ export default function DocumentVisualizer() {
     if (!rowEl) return;
     rowEl.scrollIntoView({ block: "nearest", behavior: "smooth" });
   }, [selectedFieldIndex]);
+
+  useEffect(() => {
+    if (selectedStaticBlockIndex === null) return;
+    const rowEl = staticBlockRowRefs.current[selectedStaticBlockIndex];
+    if (!rowEl) return;
+    rowEl.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [selectedStaticBlockIndex]);
+
+  useEffect(() => {
+    if (!resizingDivider) return;
+    const onMouseMove = (event: MouseEvent) => {
+      const container = document.getElementById("liteparse-main-split");
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const rel = ((event.clientX - rect.left) / rect.width) * 100;
+      const clamped = Math.max(45, Math.min(78, rel));
+      setLeftPaneWidthPct(clamped);
+    };
+    const onMouseUp = () => setResizingDivider(false);
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, [resizingDivider]);
+
+  useEffect(() => {
+    if (!pages.length || hasUserAdjustedZoom) return;
+    const container = leftPaneRef.current;
+    if (!container) return;
+    const maxPageWidth = Math.max(...pages.map((p) => p.width));
+    const available = Math.max(240, container.clientWidth - 24);
+    const fitZoom = Math.max(0.25, Math.min(2.5, available / maxPageWidth));
+    setZoom(fitZoom);
+  }, [pages, leftPaneWidthPct, hasUserAdjustedZoom]);
 
   const getPageCoordinates = (
     e: React.MouseEvent<HTMLDivElement>,
@@ -475,10 +652,8 @@ export default function DocumentVisualizer() {
       });
       const data = await res.json();
       if (data.instance) {
-        setInstanceJson(data.instance as Record<string, unknown>);
         setAnalysis(`\`\`\`json\n${JSON.stringify(data.instance, null, 2)}\n\`\`\``);
       } else if (data.extraction) {
-        setInstanceJson(null);
         setAnalysis(data.extraction);
       }
       if (data.model) setExtractionModel(data.model);
@@ -619,7 +794,6 @@ export default function DocumentVisualizer() {
     setPages([]);
     setDocumentText("");
     setAnalysis(null);
-    setInstanceJson(null);
     setTemplate(null);
     setAnalysisModel(null);
     setExtractionModel(null);
@@ -631,9 +805,13 @@ export default function DocumentVisualizer() {
     setDrawTarget({ mode: "none" });
     setDragging(null);
     setDraggingTemplateBox(null);
+    setSelectedStaticBlockIndex(null);
+    setFormTemplatePageTab("all");
     setTemplateLookupState("idle");
     setTemplateSignature(null);
     setMatchedTemplateInfo(null);
+    setHasUserAdjustedZoom(false);
+    setFieldReplacementControls({});
     
     try {
       const formData = new FormData();
@@ -665,7 +843,6 @@ export default function DocumentVisualizer() {
     setPages([]);
     setDocumentText("");
     setAnalysis(null);
-    setInstanceJson(null);
     setTemplate(null);
     setAnalysisModel(null);
     setExtractionModel(null);
@@ -677,9 +854,13 @@ export default function DocumentVisualizer() {
     setDrawTarget({ mode: "none" });
     setDragging(null);
     setDraggingTemplateBox(null);
+    setSelectedStaticBlockIndex(null);
+    setFormTemplatePageTab("all");
     setTemplateLookupState("idle");
     setTemplateSignature(null);
     setMatchedTemplateInfo(null);
+    setHasUserAdjustedZoom(false);
+    setFieldReplacementControls({});
   };
 
   const sendChatMessage = async () => {
@@ -759,8 +940,38 @@ export default function DocumentVisualizer() {
     });
   };
 
+  const selectNearestStaticBlockAtPoint = (pageNum: number, x: number, y: number) => {
+    if (!template) return false;
+    let bestIdx: number | null = null;
+    let bestDist = Number.POSITIVE_INFINITY;
+    (template.templateContent?.staticBlocks ?? []).forEach((block, idx) => {
+      if (block.page !== pageNum || !block.bbox) return;
+      const cx = block.bbox.x + block.bbox.width / 2;
+      const cy = block.bbox.y + block.bbox.height / 2;
+      const dist = Math.hypot(x - cx, y - cy);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx = idx;
+      }
+    });
+    if (bestIdx !== null && bestDist <= 80) {
+      setSelectedStaticBlockIndex(bestIdx);
+      const b = template.templateContent?.staticBlocks?.[bestIdx];
+      if (b?.page) setFormTemplatePageTab(b.page);
+      return true;
+    }
+    return false;
+  };
+
   const handlePageMouseDown = (e: React.MouseEvent<HTMLDivElement>, page: PageData) => {
     if (drawTarget.mode === "none") {
+      if (rightPaneMode === "form-template-edit" && template) {
+        const pt = getPageCoordinates(e, page.width, page.height);
+        if (selectNearestStaticBlockAtPoint(page.page, pt.x, pt.y)) {
+          return;
+        }
+      }
+
       if (selectedFieldIndex !== null) {
         const pt = getPageCoordinates(e, page.width, page.height);
         const field = template?.fields[selectedFieldIndex];
@@ -886,20 +1097,75 @@ export default function DocumentVisualizer() {
     });
   };
 
+  const applySecondPassToTemplateBody = () => {
+    setTemplate((prev) => {
+      if (!prev) return prev;
+      const nextBlocks = buildStaticBlocksFromPages(pages, prev.fields, fieldReplacementControls);
+      return {
+        ...prev,
+        templateContent: {
+          staticBlocks: nextBlocks,
+        },
+      };
+    });
+  };
+
+  const formBlocks = template?.templateContent?.staticBlocks ?? [];
+  const availableFormPages = Array.from(new Set(formBlocks.map((b) => b.page))).sort((a, b) => a - b);
+
+  const visibleFormBlocks = formBlocks
+    .map((block, idx) => ({ block, idx }))
+    .filter(({ block }) => (formTemplatePageTab === "all" ? true : block.page === formTemplatePageTab));
+
+  const getReplacementControlForField = (field: TemplateField, index: number): FieldReplacementControl => {
+    const key = field.key ?? toJsonKey(field.label || `field_${index + 1}`);
+    return defaultReplacementControl(fieldReplacementControls[key]);
+  };
+
+  const groupedVisibleFormBlocks: Array<{
+    page: number;
+    groups: Array<{
+      label: TemplateStaticBlock["displayType"];
+      key: string;
+      items: Array<{ block: TemplateStaticBlock; idx: number }>;
+    }>;
+  }> = Array.from(new Set(visibleFormBlocks.map((e) => e.block.page)))
+    .sort((a, b) => a - b)
+    .map((page) => {
+      const pageItems = visibleFormBlocks.filter((e) => e.block.page === page);
+      const labels: Array<TemplateStaticBlock["displayType"]> = ["Page Header", "Section Header", "Text"];
+      return {
+        page,
+        groups: labels
+          .map((label) => ({
+            label,
+            key: `p${page}:${label}`,
+            items: pageItems.filter((e) => e.block.displayType === label),
+          }))
+          .filter((g) => g.items.length > 0),
+      };
+    });
+
   const mergedFormPreview = (() => {
     if (!template) return [] as string[];
     const blocks = template.templateContent?.staticBlocks ?? [];
     return blocks.map((block) => {
       let merged = block.text;
-      for (const field of template.fields) {
-        const key = field.key ?? toJsonKey(field.label);
-        const value = testValues[key];
-        if (!value) continue;
-        merged = merged.replaceAll(`{{${key}}}`, value);
+      if (previewMode === "sample-values") {
+        for (const field of template.fields) {
+          const key = field.key ?? toJsonKey(field.label);
+          const value = testValues[key];
+          if (!value) continue;
+          merged = merged.replaceAll(`{{${key}}}`, value);
+        }
       }
-      return `[p${block.page}] ${block.displayType}: ${merged}`;
+      return `${showPageRefsInPreview ? `[p${block.page}] ` : ""}${block.displayType}: ${merged}`;
     });
   })();
+
+  const regenerateFormTemplateBlocks = () => {
+    applySecondPassToTemplateBody();
+  };
 
   return (
     <div className="flex flex-col h-full overflow-hidden text-neutral-200">
@@ -931,14 +1197,20 @@ export default function DocumentVisualizer() {
             </div>
           )}
           <button
-            onClick={() => setZoom(z => Math.max(0.2, z - 0.2))}
+            onClick={() => {
+              setHasUserAdjustedZoom(true);
+              setZoom((z) => Math.max(0.2, z - 0.2));
+            }}
             className="p-2 bg-neutral-800 hover:bg-neutral-700 rounded-md transition-colors"
           >
             <ZoomOut size={18} />
           </button>
           <span className="text-sm text-neutral-400 font-mono w-12 text-center">{Math.round(zoom * 100)}%</span>
           <button
-            onClick={() => setZoom(z => Math.min(3, z + 0.2))}
+            onClick={() => {
+              setHasUserAdjustedZoom(true);
+              setZoom((z) => Math.min(3, z + 0.2));
+            }}
             className="p-2 bg-neutral-800 hover:bg-neutral-700 rounded-md transition-colors"
           >
             <ZoomIn size={18} />
@@ -953,7 +1225,7 @@ export default function DocumentVisualizer() {
         </div>
       </div>
 
-      <div className="flex flex-1 overflow-hidden bg-[#0a0a0c]">
+      <div id="liteparse-main-split" className="flex flex-1 overflow-hidden bg-[#0a0a0c]">
         {pages.length === 0 ? (
           <div className="w-full h-full flex items-center justify-center p-8">
             <div 
@@ -1006,7 +1278,11 @@ export default function DocumentVisualizer() {
         ) : (
           <>
             {/* Left Box: PDF Render */}
-            <div className="flex-1 overflow-auto p-8 pb-32 flex flex-col items-center">
+            <div
+              ref={leftPaneRef}
+              className="overflow-auto p-2 pb-16 flex flex-col items-center"
+              style={{ width: `${leftPaneWidthPct}%` }}
+            >
               <div className="flex flex-col space-y-12 items-center w-full">
                 {pages.map((p, i) => {
                   const scaleX = 100 / p.width;
@@ -1047,6 +1323,12 @@ export default function DocumentVisualizer() {
                                   setHoveredText(null);
                                   setHoveredItem(null);
                                 }}
+                                onClick={() => {
+                                  if (rightPaneMode !== "form-template-edit") return;
+                                  const cx = item.x + item.width / 2;
+                                  const cy = item.y + item.height / 2;
+                                  void selectNearestStaticBlockAtPoint(p.page, cx, cy);
+                                }}
                                 className="absolute border border-indigo-500/40 bg-indigo-400/10 hover:bg-orange-400/40 hover:border-orange-500 transition-colors pointer-events-auto cursor-crosshair rounded-sm"
                                 style={{
                                   left: `${left}%`,
@@ -1065,7 +1347,10 @@ export default function DocumentVisualizer() {
                             pageOverlayRefs.current[p.page] = el;
                           }}
                           className={`absolute inset-0 ${
-                            drawTarget.mode !== "none" || selectedFieldIndex !== null || draggingTemplateBox
+                            drawTarget.mode !== "none" ||
+                            selectedFieldIndex !== null ||
+                            draggingTemplateBox ||
+                            rightPaneMode === "form-template-edit"
                               ? "pointer-events-auto"
                               : "pointer-events-none"
                           }`}
@@ -1073,16 +1358,32 @@ export default function DocumentVisualizer() {
                           onMouseMove={(e) => handlePageMouseMove(e, p)}
                           onMouseUp={(e) => handlePageMouseUp(e, p)}
                         >
+                          {selectedStaticBlockIndex !== null &&
+                            (() => {
+                              const selectedBlock = template?.templateContent?.staticBlocks?.[selectedStaticBlockIndex];
+                              if (!selectedBlock || selectedBlock.page !== p.page || !selectedBlock.bbox) return null;
+                              const sLeft = (selectedBlock.bbox.x / p.width) * 100;
+                              const sTop = (selectedBlock.bbox.y / p.height) * 100;
+                              const sWidth = (selectedBlock.bbox.width / p.width) * 100;
+                              const sHeight = (selectedBlock.bbox.height / p.height) * 100;
+                              return (
+                                <div
+                                  className="absolute rounded border border-fuchsia-400 bg-fuchsia-300/30 shadow-[0_0_0_1px_rgba(217,70,239,0.85)] pointer-events-none"
+                                  style={{
+                                    left: `${sLeft}%`,
+                                    top: `${sTop}%`,
+                                    width: `${sWidth}%`,
+                                    height: `${sHeight}%`,
+                                  }}
+                                />
+                              );
+                            })()}
                           {template?.fields.map((field, fieldIdx) => {
                             if (field.page !== p.page) return null;
                             if (selectedFieldIndex !== fieldIdx) return null;
                             const boxes = getFieldBoxes(field);
                             if (!boxes.length) return null;
                             return boxes.map((box, boxIdx) => {
-                              const left = (box.x / p.width) * 100;
-                              const top = (box.y / p.height) * 100;
-                              const width = (box.width / p.width) * 100;
-                              const height = (box.height / p.height) * 100;
                               const selected = selectedFieldIndex === fieldIdx;
                               const normalizedBox = normalizeEditableBox(box);
                               const nLeft = (normalizedBox.x / p.width) * 100;
@@ -1162,8 +1463,20 @@ export default function DocumentVisualizer() {
               </div>
             </div>
 
+            <div
+              className={`w-2 shrink-0 bg-neutral-900 hover:bg-indigo-700/70 transition-colors ${
+                resizingDivider ? "bg-indigo-700/90" : ""
+              }`}
+              onMouseDown={() => setResizingDivider(true)}
+              title="Drag to resize panes"
+              style={{ cursor: "col-resize" }}
+            />
+
             {/* Right Box: Template + Chat */}
-            <div className="w-1/3 min-w-[350px] max-w-lg border-l border-neutral-800 bg-neutral-900/40 p-6 flex flex-col shadow-2xl">
+            <div
+              className="min-w-[320px] border-l border-neutral-800 bg-neutral-900/40 p-4 flex flex-col shadow-2xl"
+              style={{ width: `${100 - leftPaneWidthPct}%` }}
+            >
               <div className="flex items-center text-indigo-400 mb-6 pb-4 border-b border-neutral-800">
                 <Sparkles className="w-5 h-5 mr-3" />
                 <h2 className="text-xl font-semibold">Gemini Template + Chat</h2>
@@ -1190,7 +1503,12 @@ export default function DocumentVisualizer() {
                   Extract
                 </button>
                 <button
-                  onClick={() => setRightPaneMode("form-template-edit")}
+                  onClick={() => {
+                    setRightPaneMode("form-template-edit");
+                    if (!template?.templateContent?.staticBlocks?.length) {
+                      applySecondPassToTemplateBody();
+                    }
+                  }}
                   className={`rounded-md px-2 py-1.5 text-xs ${
                     rightPaneMode === "form-template-edit"
                       ? "bg-indigo-700 text-white"
@@ -1335,7 +1653,7 @@ export default function DocumentVisualizer() {
                     {template && rightPaneMode === "field-edit" && (
                       <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 space-y-2">
                         <div className="flex items-center justify-between">
-                          <h4 className="text-xs uppercase tracking-wide text-neutral-400">Template JSON</h4>
+                          <h4 className="text-xs uppercase tracking-wide text-neutral-400">Field Template JSON</h4>
                           <button
                             onClick={() => void navigator.clipboard.writeText(JSON.stringify(template, null, 2))}
                             className="rounded bg-neutral-800 hover:bg-neutral-700 px-2 py-1 text-[11px]"
@@ -1601,9 +1919,50 @@ export default function DocumentVisualizer() {
                     {rightPaneMode === "form-template-edit" && template && (
                       <div className="space-y-4">
                         <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 space-y-2">
-                          <h4 className="text-xs uppercase tracking-wide text-neutral-400">
-                            Form Template Blocks ({template.templateContent?.staticBlocks?.length ?? 0})
-                          </h4>
+                          <div className="flex items-center justify-between gap-2">
+                            <h4 className="text-xs uppercase tracking-wide text-neutral-400">
+                              Form Template Blocks ({template.templateContent?.staticBlocks?.length ?? 0})
+                            </h4>
+                            <div className="flex items-center gap-2">
+                              <button
+                                onClick={applySecondPassToTemplateBody}
+                                className="rounded bg-indigo-700 hover:bg-indigo-600 px-2 py-1 text-xs"
+                              >
+                                Apply Field Edits To Body (Pass 2)
+                              </button>
+                              <button
+                                onClick={regenerateFormTemplateBlocks}
+                                className="rounded bg-neutral-800 hover:bg-neutral-700 px-2 py-1 text-xs"
+                              >
+                                Regenerate
+                              </button>
+                            </div>
+                          </div>
+                          <div className="flex flex-wrap gap-2 pt-1">
+                            <button
+                              onClick={() => setFormTemplatePageTab("all")}
+                              className={`rounded px-2 py-1 text-xs ${
+                                formTemplatePageTab === "all"
+                                  ? "bg-indigo-700 text-white"
+                                  : "bg-neutral-800 hover:bg-neutral-700 text-neutral-300"
+                              }`}
+                            >
+                              All Pages
+                            </button>
+                            {availableFormPages.map((pg) => (
+                              <button
+                                key={pg}
+                                onClick={() => setFormTemplatePageTab(pg)}
+                                className={`rounded px-2 py-1 text-xs ${
+                                  formTemplatePageTab === pg
+                                    ? "bg-indigo-700 text-white"
+                                    : "bg-neutral-800 hover:bg-neutral-700 text-neutral-300"
+                                }`}
+                              >
+                                p{pg}
+                              </button>
+                            ))}
+                          </div>
                           <div className="flex gap-2">
                             <button
                               onClick={() => addHoveredTextAsStaticBlock("Page Header")}
@@ -1620,53 +1979,210 @@ export default function DocumentVisualizer() {
                               Insert Section Header
                             </button>
                           </div>
-                          <div className="max-h-44 overflow-auto space-y-2">
-                            {(template.templateContent?.staticBlocks ?? []).map((block, idx) => (
-                              <div key={`${block.key}-${idx}`} className="border border-neutral-800 rounded p-2 space-y-1">
-                                <div className="text-[11px] text-neutral-400">p{block.page}</div>
-                                <input
-                                  value={block.key}
-                                  onChange={(e) =>
-                                    setTemplate((prev) => {
-                                      if (!prev) return prev;
-                                      const blocks = [...(prev.templateContent?.staticBlocks ?? [])];
-                                      blocks[idx] = { ...blocks[idx], key: toJsonKey(e.target.value) };
-                                      return { ...prev, templateContent: { staticBlocks: blocks } };
-                                    })
-                                  }
-                                  className="w-full rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs"
-                                />
-                                <select
-                                  value={block.displayType}
-                                  onChange={(e) =>
-                                    setTemplate((prev) => {
-                                      if (!prev) return prev;
-                                      const blocks = [...(prev.templateContent?.staticBlocks ?? [])];
-                                      blocks[idx] = {
-                                        ...blocks[idx],
-                                        displayType: e.target.value as TemplateStaticBlock["displayType"],
-                                      };
-                                      return { ...prev, templateContent: { staticBlocks: blocks } };
-                                    })
-                                  }
-                                  className="w-full rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs"
-                                >
-                                  <option value="Page Header">Page Header</option>
-                                  <option value="Section Header">Section Header</option>
-                                  <option value="Text">Text</option>
-                                </select>
-                                <textarea
-                                  value={block.text}
-                                  onChange={(e) =>
-                                    setTemplate((prev) => {
-                                      if (!prev) return prev;
-                                      const blocks = [...(prev.templateContent?.staticBlocks ?? [])];
-                                      blocks[idx] = { ...blocks[idx], text: e.target.value };
-                                      return { ...prev, templateContent: { staticBlocks: blocks } };
-                                    })
-                                  }
-                                  className="w-full rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs min-h-16"
-                                />
+                          <div className="rounded border border-neutral-800 bg-neutral-950/60 p-2 space-y-2">
+                            <div className="text-[11px] uppercase tracking-wide text-neutral-500">
+                              Per-Field Replacement Controls (Second Pass)
+                            </div>
+                            <div className="space-y-2">
+                              {template.fields.map((field, idx) => {
+                                const key = field.key ?? toJsonKey(field.label || `field_${idx + 1}`);
+                                const control = getReplacementControlForField(field, idx);
+                                return (
+                                  <div key={`replace-ctl-${key}-${idx}`} className="rounded border border-neutral-800 p-2 space-y-1">
+                                    <div className="flex items-center justify-between gap-2">
+                                      <div className="text-xs text-neutral-300 truncate">
+                                        {field.label}
+                                        <span className="text-neutral-500 ml-1">({key})</span>
+                                      </div>
+                                      <label className="flex items-center gap-1 text-[11px] text-neutral-400 shrink-0">
+                                        <input
+                                          type="checkbox"
+                                          checked={control.enabled}
+                                          onChange={(e) =>
+                                            setFieldReplacementControls((prev) => ({
+                                              ...prev,
+                                              [key]: defaultReplacementControl({
+                                                ...prev[key],
+                                                enabled: e.target.checked,
+                                              }),
+                                            }))
+                                          }
+                                        />
+                                        Enabled
+                                      </label>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-2">
+                                      <label className="text-[11px] text-neutral-500 space-y-1">
+                                        <span>Strength</span>
+                                        <select
+                                          value={control.strength}
+                                          onChange={(e) =>
+                                            setFieldReplacementControls((prev) => ({
+                                              ...prev,
+                                              [key]: defaultReplacementControl({
+                                                ...prev[key],
+                                                strength: e.target.value as ReplacementStrength,
+                                              }),
+                                            }))
+                                          }
+                                          className="w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs"
+                                        >
+                                          <option value="light">light</option>
+                                          <option value="balanced">balanced</option>
+                                          <option value="aggressive">aggressive</option>
+                                        </select>
+                                      </label>
+                                      <label className="text-[11px] text-neutral-500 space-y-1">
+                                        <span>X Pad (px)</span>
+                                        <input
+                                          type="number"
+                                          min={0}
+                                          value={control.xPad}
+                                          onChange={(e) =>
+                                            setFieldReplacementControls((prev) => ({
+                                              ...prev,
+                                              [key]: defaultReplacementControl({
+                                                ...prev[key],
+                                                xPad: Number(e.target.value),
+                                              }),
+                                            }))
+                                          }
+                                          className="w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs"
+                                        />
+                                      </label>
+                                      <label className="text-[11px] text-neutral-500 space-y-1">
+                                        <span>Y Tolerance (px)</span>
+                                        <input
+                                          type="number"
+                                          min={4}
+                                          value={control.yTolerance}
+                                          onChange={(e) =>
+                                            setFieldReplacementControls((prev) => ({
+                                              ...prev,
+                                              [key]: defaultReplacementControl({
+                                                ...prev[key],
+                                                yTolerance: Number(e.target.value),
+                                              }),
+                                            }))
+                                          }
+                                          className="w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs"
+                                        />
+                                      </label>
+                                      <label className="flex items-center gap-2 text-[11px] text-neutral-500">
+                                        <input
+                                          type="checkbox"
+                                          checked={control.forceNearestToken}
+                                          onChange={(e) =>
+                                            setFieldReplacementControls((prev) => ({
+                                              ...prev,
+                                              [key]: defaultReplacementControl({
+                                                ...prev[key],
+                                                forceNearestToken: e.target.checked,
+                                              }),
+                                            }))
+                                          }
+                                        />
+                                        Force nearest token replacement
+                                      </label>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                          <div className="space-y-3">
+                            {groupedVisibleFormBlocks.map((pageGroup) => (
+                              <div key={`page-group-${pageGroup.page}`} className="space-y-2">
+                                <h5 className="text-[11px] uppercase tracking-wide text-neutral-500">
+                                  Page {pageGroup.page}
+                                </h5>
+                                {pageGroup.groups.map((group) => {
+                                  const isCollapsed = collapsedGroups[group.key] ?? false;
+                                  return (
+                                    <div key={group.key} className="border border-neutral-800 rounded">
+                                      <button
+                                        className="w-full flex items-center justify-between px-2 py-1.5 text-xs bg-neutral-950/70 hover:bg-neutral-900"
+                                        onClick={() =>
+                                          setCollapsedGroups((prev) => ({
+                                            ...prev,
+                                            [group.key]: !isCollapsed,
+                                          }))
+                                        }
+                                      >
+                                        <span>
+                                          {group.label} ({group.items.length})
+                                        </span>
+                                        <span className="text-neutral-500">{isCollapsed ? "+" : "-"}</span>
+                                      </button>
+                                      {!isCollapsed && (
+                                        <div className="space-y-2 p-2">
+                                          {group.items.map(({ block, idx }) => (
+                                            <div
+                                              key={`${block.key}-${idx}`}
+                                              ref={(el) => {
+                                                staticBlockRowRefs.current[idx] = el;
+                                              }}
+                                              className={`border rounded p-2 space-y-1 ${
+                                                selectedStaticBlockIndex === idx
+                                                  ? "border-fuchsia-500 bg-fuchsia-900/15"
+                                                  : "border-neutral-800"
+                                              }`}
+                                              onClick={() => {
+                                                setSelectedStaticBlockIndex(idx);
+                                                setFormTemplatePageTab(block.page);
+                                              }}
+                                            >
+                                              <div className="text-[11px] text-neutral-400">p{block.page}</div>
+                                              <input
+                                                value={block.key}
+                                                onChange={(e) =>
+                                                  setTemplate((prev) => {
+                                                    if (!prev) return prev;
+                                                    const blocks = [...(prev.templateContent?.staticBlocks ?? [])];
+                                                    blocks[idx] = { ...blocks[idx], key: toJsonKey(e.target.value) };
+                                                    return { ...prev, templateContent: { staticBlocks: blocks } };
+                                                  })
+                                                }
+                                                className="w-full rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs"
+                                              />
+                                              <select
+                                                value={block.displayType}
+                                                onChange={(e) =>
+                                                  setTemplate((prev) => {
+                                                    if (!prev) return prev;
+                                                    const blocks = [...(prev.templateContent?.staticBlocks ?? [])];
+                                                    blocks[idx] = {
+                                                      ...blocks[idx],
+                                                      displayType: e.target.value as TemplateStaticBlock["displayType"],
+                                                    };
+                                                    return { ...prev, templateContent: { staticBlocks: blocks } };
+                                                  })
+                                                }
+                                                className="w-full rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs"
+                                              >
+                                                <option value="Page Header">Page Header</option>
+                                                <option value="Section Header">Section Header</option>
+                                                <option value="Text">Text</option>
+                                              </select>
+                                              <textarea
+                                                value={block.text}
+                                                onChange={(e) =>
+                                                  setTemplate((prev) => {
+                                                    if (!prev) return prev;
+                                                    const blocks = [...(prev.templateContent?.staticBlocks ?? [])];
+                                                    blocks[idx] = { ...blocks[idx], text: e.target.value };
+                                                    return { ...prev, templateContent: { staticBlocks: blocks } };
+                                                  })
+                                                }
+                                                className="w-full rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs min-h-16"
+                                              />
+                                            </div>
+                                          ))}
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
                               </div>
                             ))}
                           </div>
@@ -1674,7 +2190,7 @@ export default function DocumentVisualizer() {
 
                         <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 space-y-2">
                           <h4 className="text-xs uppercase tracking-wide text-neutral-400">Field Value Input Test</h4>
-                          <div className="max-h-40 overflow-auto space-y-2">
+                          <div className="space-y-2">
                             {template.fields.map((field, idx) => {
                               const key = field.key ?? toJsonKey(field.label || `field_${idx + 1}`);
                               return (
@@ -1694,10 +2210,60 @@ export default function DocumentVisualizer() {
                         </div>
 
                         <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 space-y-2">
-                          <h4 className="text-xs uppercase tracking-wide text-neutral-400">Merged Preview</h4>
-                          <pre className="max-h-40 overflow-auto rounded border border-neutral-800 bg-neutral-950 p-2 text-[11px] text-neutral-300 whitespace-pre-wrap">
+                          <div className="flex items-center justify-between">
+                            <h4 className="text-xs uppercase tracking-wide text-neutral-400">Merged Preview</h4>
+                            <button
+                              onClick={() => setShowPreviewOptions(true)}
+                              className="rounded bg-neutral-800 hover:bg-neutral-700 px-2 py-1 text-xs"
+                            >
+                              Preview Options
+                            </button>
+                          </div>
+                          <pre className="rounded border border-neutral-800 bg-neutral-950 p-2 text-[11px] text-neutral-300 whitespace-pre-wrap">
                             {mergedFormPreview.join("\n\n")}
                           </pre>
+                        </div>
+                      </div>
+                    )}
+                    {showPreviewOptions && (
+                      <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
+                        <div className="w-full max-w-md rounded-md border border-neutral-700 bg-neutral-900 p-4 space-y-3">
+                          <h4 className="text-sm font-semibold text-white">Merged Preview Options</h4>
+                          <label className="flex items-center gap-2 text-sm text-neutral-300">
+                            <input
+                              type="checkbox"
+                              checked={showPageRefsInPreview}
+                              onChange={(e) => setShowPageRefsInPreview(e.target.checked)}
+                            />
+                            Show [p#] page references
+                          </label>
+                          <div className="space-y-1 text-sm text-neutral-300">
+                            <div className="text-xs uppercase tracking-wide text-neutral-500">Preview mode</div>
+                            <label className="flex items-center gap-2">
+                              <input
+                                type="radio"
+                                checked={previewMode === "merge-codes"}
+                                onChange={() => setPreviewMode("merge-codes")}
+                              />
+                              Merge codes only (keep {`{{field_key}}`})
+                            </label>
+                            <label className="flex items-center gap-2">
+                              <input
+                                type="radio"
+                                checked={previewMode === "sample-values"}
+                                onChange={() => setPreviewMode("sample-values")}
+                              />
+                              Substitute sample values
+                            </label>
+                          </div>
+                          <div className="flex justify-end">
+                            <button
+                              onClick={() => setShowPreviewOptions(false)}
+                              className="rounded bg-indigo-700 hover:bg-indigo-600 px-3 py-1.5 text-sm"
+                            >
+                              Done
+                            </button>
+                          </div>
                         </div>
                       </div>
                     )}
