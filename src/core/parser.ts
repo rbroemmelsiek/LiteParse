@@ -235,9 +235,10 @@ export class LiteParse {
 
     log(`Generating screenshots for: ${typeof input === "string" ? input : "<buffer>"}`);
 
-    // Load PDF document to get page count and dimensions
+    // Prevent detached ArrayBuffer by cloning the buffer for the PDF.js engine
+    const documentInput = typeof input === "string" ? input : new Uint8Array(input).slice();
     const doc = await this.pdfEngine.loadDocument(
-      input as string | Uint8Array,
+      documentInput,
       this.config.password
     );
     const totalPages = doc.numPages;
