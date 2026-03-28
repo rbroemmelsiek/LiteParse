@@ -90,6 +90,7 @@ type DisplayType =
   | "File"
   | "Video (Url)"
   | "Page Header"
+  | "Section Header"
   | "ChangeCounter"
   | "ChangeLocation"
   | "ChangeTimestamp"
@@ -97,6 +98,7 @@ type DisplayType =
   | "App";
 
 interface TemplateField {
+  key?: string;
   label: string;
   type: FieldType;
   displayType?: DisplayType;
@@ -119,9 +121,19 @@ interface TemplateField {
   }>;
 }
 
+interface TemplateStaticBlock {
+  key: string;
+  displayType: "Page Header" | "Section Header" | "Text";
+  page: number;
+  text: string;
+}
+
 interface TemplateDefinition {
   templateName: string;
   fields: TemplateField[];
+  templateContent?: {
+    staticBlocks: TemplateStaticBlock[];
+  };
   notes: string[];
 }
 
@@ -146,7 +158,7 @@ interface BoxRect {
 type DrawTarget =
   | { mode: "none" }
   | { mode: "assign"; fieldIndex: number }
-  | { mode: "add"; draft: { label: string; type: FieldType; displayType: DisplayType } };
+  | { mode: "add"; draft: { label: string; key: string; type: FieldType; displayType: DisplayType } };
 
 export default function DocumentVisualizer() {
   const [file, setFile] = useState<File | null>(null);
@@ -164,14 +176,17 @@ export default function DocumentVisualizer() {
   const [pages, setPages] = useState<PageData[]>([]);
   const [documentText, setDocumentText] = useState("");
   const [analysis, setAnalysis] = useState<string | null>(null);
+  const [instanceJson, setInstanceJson] = useState<Record<string, unknown> | null>(null);
   const [template, setTemplate] = useState<TemplateDefinition | null>(null);
   const [analysisModel, setAnalysisModel] = useState<string | null>(null);
   const [extractionModel, setExtractionModel] = useState<string | null>(null);
   const [chatModel, setChatModel] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
+  const [rightPaneMode, setRightPaneMode] = useState<"field-edit" | "extract" | "form-template-edit">("field-edit");
   const [selectedFieldIndex, setSelectedFieldIndex] = useState<number | null>(null);
   const [newFieldLabel, setNewFieldLabel] = useState("");
+  const [newFieldKey, setNewFieldKey] = useState("");
   const [newFieldType, setNewFieldType] = useState<FieldType>("text");
   const [newFieldDisplayType, setNewFieldDisplayType] = useState<DisplayType>("Text");
   const [drawTarget, setDrawTarget] = useState<DrawTarget>({ mode: "none" });
@@ -190,9 +205,11 @@ export default function DocumentVisualizer() {
     offsetY: number;
   } | null>(null);
   const [hoveredText, setHoveredText] = useState<string | null>(null);
+  const [hoveredItem, setHoveredItem] = useState<{ page: number; text: string } | null>(null);
   const [zoom, setZoom] = useState(1);
   const pageOverlayRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const fieldRowRefs = useRef<Record<number, HTMLButtonElement | null>>({});
+  const [testValues, setTestValues] = useState<Record<string, string>>({});
   const fieldTypes: FieldType[] = [
     "boolean",
     "text",
@@ -242,6 +259,7 @@ export default function DocumentVisualizer() {
     "File",
     "Video (Url)",
     "Page Header",
+    "Section Header",
     "ChangeCounter",
     "ChangeLocation",
     "ChangeTimestamp",
@@ -263,6 +281,61 @@ export default function DocumentVisualizer() {
       y: box.y,
       width: Number.isFinite(box.width) ? Math.max(minW, box.width) : minW,
       height: Number.isFinite(box.height) ? Math.max(minH, box.height) : minH,
+    };
+  };
+
+  const toJsonKey = (label: string) =>
+    label
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "") || "field";
+
+  const buildStaticBlocksFromPages = (sourcePages: PageData[]): TemplateStaticBlock[] => {
+    const blocks: TemplateStaticBlock[] = [];
+
+    sourcePages.forEach((p) => {
+      const rows = [...(p.textItems ?? [])].sort((a, b) => (a.y === b.y ? a.x - b.x : a.y - b.y));
+      const grouped: Array<{ y: number; text: string }> = [];
+      const tol = 5;
+      for (const item of rows) {
+        const text = item.text?.trim();
+        if (!text) continue;
+        const target = grouped.find((g) => Math.abs(g.y - item.y) <= tol);
+        if (target) {
+          target.text = `${target.text} ${text}`.trim();
+        } else {
+          grouped.push({ y: item.y, text });
+        }
+      }
+
+      grouped.forEach((row, idx) => {
+        const normalized = row.text.replace(/\s+/g, " ").trim();
+        const looksHeader = idx === 0 || /^[A-Z0-9 .,'&()/-]{8,}$/.test(normalized);
+        const displayType: TemplateStaticBlock["displayType"] =
+          idx === 0 ? "Page Header" : looksHeader ? "Section Header" : "Text";
+        blocks.push({
+          key: `p${p.page}_block_${idx + 1}`,
+          displayType,
+          page: p.page,
+          text: normalized,
+        });
+      });
+    });
+
+    return blocks;
+  };
+
+  const normalizeTemplateForClient = (input: TemplateDefinition): TemplateDefinition => {
+    const normalizedFields = input.fields.map((field, idx) => ({
+      ...field,
+      key: field.key && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(field.key) ? field.key : toJsonKey(field.label || `field_${idx + 1}`),
+      displayType: field.displayType ?? "Text",
+    }));
+    return {
+      ...input,
+      fields: normalizedFields,
+      templateContent: input.templateContent ?? { staticBlocks: buildStaticBlocksFromPages(pages) },
     };
   };
 
@@ -395,11 +468,19 @@ export default function DocumentVisualizer() {
           text: nextText,
           pages: toTextStructurePages(nextPages),
           template: nextTemplate,
+          libraryId,
+          templateSignature: templateSignature ?? undefined,
           includeImages: false,
         }),
       });
       const data = await res.json();
-      if (data.extraction) setAnalysis(data.extraction);
+      if (data.instance) {
+        setInstanceJson(data.instance as Record<string, unknown>);
+        setAnalysis(`\`\`\`json\n${JSON.stringify(data.instance, null, 2)}\n\`\`\``);
+      } else if (data.extraction) {
+        setInstanceJson(null);
+        setAnalysis(data.extraction);
+      }
       if (data.model) setExtractionModel(data.model);
       if (data.error) setAnalysis(`**Extraction Error:** ${data.error}`);
     } catch {
@@ -424,9 +505,10 @@ export default function DocumentVisualizer() {
       const data = await res.json();
 
       if (data.found && data.template) {
+        const matchedTemplate = normalizeTemplateForClient(data.template);
         setTemplateLookupState("found");
-        setTemplate(data.template);
-        setSelectedFieldIndex(data.template.fields?.length ? 0 : null);
+        setTemplate(matchedTemplate);
+        setSelectedFieldIndex(matchedTemplate.fields?.length ? 0 : null);
         setMatchedTemplateInfo({
           templateName: data.templateName,
           sourcePdfUrl: data.sourcePdfUrl,
@@ -434,7 +516,7 @@ export default function DocumentVisualizer() {
         });
         setTemplateSignature(data.signature ?? null);
         setAnalysis(`Using template **${data.templateName || "Unnamed Template"}** from library **${libraryId}**.`);
-        await runExtraction(data.template, nextText, nextPages);
+        await runExtraction(matchedTemplate, nextText, nextPages);
         return;
       }
 
@@ -444,7 +526,7 @@ export default function DocumentVisualizer() {
       setTemplate(null);
       setSelectedFieldIndex(null);
       setAnalysis(
-        `No existing template match in library **${libraryId}**. Create a new template (Gemini 3.1 Pro) and save it.`,
+        `No existing template match in library **${libraryId}**. Create a new template (Gemini 3.1 Pro), then save to library as the final step.`,
       );
     } catch (error) {
       setTemplateLookupState("error");
@@ -476,11 +558,12 @@ export default function DocumentVisualizer() {
         setAnalysis(`**Template generation error:** ${aiData.error || "No template output"}`);
         return null;
       }
-      setTemplate(aiData.template);
-      setSelectedFieldIndex(aiData.template.fields?.length ? 0 : null);
+      const nextTemplate = normalizeTemplateForClient(aiData.template);
+      setTemplate(nextTemplate);
+      setSelectedFieldIndex(nextTemplate.fields?.length ? 0 : null);
       if (aiData.model) setAnalysisModel(aiData.model);
       if (aiData.analysis) setAnalysis(aiData.analysis);
-      return aiData.template as TemplateDefinition;
+      return nextTemplate;
     } catch {
       setAnalysis("**Error communicating with Gemini template model.**");
       return null;
@@ -536,6 +619,7 @@ export default function DocumentVisualizer() {
     setPages([]);
     setDocumentText("");
     setAnalysis(null);
+    setInstanceJson(null);
     setTemplate(null);
     setAnalysisModel(null);
     setExtractionModel(null);
@@ -543,6 +627,7 @@ export default function DocumentVisualizer() {
     setChatMessages([]);
     setChatInput("");
     setSelectedFieldIndex(null);
+    setNewFieldKey("");
     setDrawTarget({ mode: "none" });
     setDragging(null);
     setDraggingTemplateBox(null);
@@ -580,6 +665,7 @@ export default function DocumentVisualizer() {
     setPages([]);
     setDocumentText("");
     setAnalysis(null);
+    setInstanceJson(null);
     setTemplate(null);
     setAnalysisModel(null);
     setExtractionModel(null);
@@ -587,6 +673,7 @@ export default function DocumentVisualizer() {
     setChatMessages([]);
     setChatInput("");
     setSelectedFieldIndex(null);
+    setNewFieldKey("");
     setDrawTarget({ mode: "none" });
     setDragging(null);
     setDraggingTemplateBox(null);
@@ -643,8 +730,9 @@ export default function DocumentVisualizer() {
     if (!documentText || !pages.length) return;
     const nextTemplate = await generateTemplateFromCurrentDoc();
     if (!nextTemplate) return;
-    await saveTemplateToLibrary(nextTemplate);
-    await runExtraction(nextTemplate, documentText, pages);
+    setAnalysis(
+      "Template generated. Review/edit fields, then click **Save To Library** as your final step.",
+    );
   };
 
   const handleSaveCurrentTemplate = async () => {
@@ -662,12 +750,45 @@ export default function DocumentVisualizer() {
     if (!trimmed) return;
     setDrawTarget({
       mode: "add",
-      draft: { label: trimmed, type: newFieldType, displayType: newFieldDisplayType },
+      draft: {
+        label: trimmed,
+        key: newFieldKey.trim() || toJsonKey(trimmed),
+        type: newFieldType,
+        displayType: newFieldDisplayType,
+      },
     });
   };
 
   const handlePageMouseDown = (e: React.MouseEvent<HTMLDivElement>, page: PageData) => {
-    if (drawTarget.mode === "none") return;
+    if (drawTarget.mode === "none") {
+      if (selectedFieldIndex !== null) {
+        const pt = getPageCoordinates(e, page.width, page.height);
+        const field = template?.fields[selectedFieldIndex];
+        if (!field) return;
+        const boxes = getFieldBoxes(field);
+        const current = boxes[0] ?? { x: 0, y: 0, width: 60, height: 18 };
+        const normalized = normalizeEditableBox(current);
+        updateTemplateField(selectedFieldIndex, (f) => ({
+          ...f,
+          page: page.page,
+          bbox: {
+            x: Math.max(0, Math.min(page.width - normalized.width, pt.x - normalized.width / 2)),
+            y: Math.max(0, Math.min(page.height - normalized.height, pt.y - normalized.height / 2)),
+            width: normalized.width,
+            height: normalized.height,
+          },
+          bboxes: [
+            {
+              x: Math.max(0, Math.min(page.width - normalized.width, pt.x - normalized.width / 2)),
+              y: Math.max(0, Math.min(page.height - normalized.height, pt.y - normalized.height / 2)),
+              width: normalized.width,
+              height: normalized.height,
+            },
+          ],
+        }));
+      }
+      return;
+    }
     const pt = getPageCoordinates(e, page.width, page.height);
     setDragging({
       page: page.page,
@@ -713,6 +834,7 @@ export default function DocumentVisualizer() {
           notes: [],
         };
         const newField: TemplateField = {
+          key: drawTarget.draft.key,
           label: drawTarget.draft.label,
           type: drawTarget.draft.type,
           displayType: drawTarget.draft.displayType,
@@ -729,6 +851,7 @@ export default function DocumentVisualizer() {
         return next;
       });
       setNewFieldLabel("");
+      setNewFieldKey("");
       setNewFieldDisplayType("Text");
       return;
     }
@@ -742,6 +865,41 @@ export default function DocumentVisualizer() {
     setDragging(null);
     setDrawTarget({ mode: "none" });
   };
+
+  const addHoveredTextAsStaticBlock = (displayType: "Page Header" | "Section Header" | "Text") => {
+    if (!template || !hoveredItem) return;
+    setTemplate((prev) => {
+      if (!prev) return prev;
+      const current = prev.templateContent?.staticBlocks ?? [];
+      const nextBlock: TemplateStaticBlock = {
+        key: `p${hoveredItem.page}_manual_${current.length + 1}`,
+        displayType,
+        page: hoveredItem.page,
+        text: hoveredItem.text,
+      };
+      return {
+        ...prev,
+        templateContent: {
+          staticBlocks: [...current, nextBlock],
+        },
+      };
+    });
+  };
+
+  const mergedFormPreview = (() => {
+    if (!template) return [] as string[];
+    const blocks = template.templateContent?.staticBlocks ?? [];
+    return blocks.map((block) => {
+      let merged = block.text;
+      for (const field of template.fields) {
+        const key = field.key ?? toJsonKey(field.label);
+        const value = testValues[key];
+        if (!value) continue;
+        merged = merged.replaceAll(`{{${key}}}`, value);
+      }
+      return `[p${block.page}] ${block.displayType}: ${merged}`;
+    });
+  })();
 
   return (
     <div className="flex flex-col h-full overflow-hidden text-neutral-200">
@@ -881,8 +1039,14 @@ export default function DocumentVisualizer() {
                             return (
                               <div
                                 key={idx}
-                                onMouseEnter={() => setHoveredText(item.text)}
-                                onMouseLeave={() => setHoveredText(null)}
+                                onMouseEnter={() => {
+                                  setHoveredText(item.text);
+                                  setHoveredItem({ page: p.page, text: item.text });
+                                }}
+                                onMouseLeave={() => {
+                                  setHoveredText(null);
+                                  setHoveredItem(null);
+                                }}
                                 className="absolute border border-indigo-500/40 bg-indigo-400/10 hover:bg-orange-400/40 hover:border-orange-500 transition-colors pointer-events-auto cursor-crosshair rounded-sm"
                                 style={{
                                   left: `${left}%`,
@@ -943,7 +1107,12 @@ export default function DocumentVisualizer() {
                                     if (!selected) return;
                                     e.preventDefault();
                                     e.stopPropagation();
-                                    const pt = getPageCoordinates(e, p.width, p.height);
+                                    const overlay = pageOverlayRefs.current[p.page];
+                                    if (!overlay) return;
+                                    const rect = overlay.getBoundingClientRect();
+                                    const relX = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+                                    const relY = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+                                    const pt = { x: relX * p.width, y: relY * p.height };
                                     if (
                                       box.width !== normalizedBox.width ||
                                       box.height !== normalizedBox.height
@@ -998,6 +1167,38 @@ export default function DocumentVisualizer() {
               <div className="flex items-center text-indigo-400 mb-6 pb-4 border-b border-neutral-800">
                 <Sparkles className="w-5 h-5 mr-3" />
                 <h2 className="text-xl font-semibold">Gemini Template + Chat</h2>
+              </div>
+              <div className="grid grid-cols-3 gap-2 mb-4">
+                <button
+                  onClick={() => setRightPaneMode("field-edit")}
+                  className={`rounded-md px-2 py-1.5 text-xs ${
+                    rightPaneMode === "field-edit"
+                      ? "bg-indigo-700 text-white"
+                      : "bg-neutral-800 text-neutral-300"
+                  }`}
+                >
+                  Field Edit
+                </button>
+                <button
+                  onClick={() => setRightPaneMode("extract")}
+                  className={`rounded-md px-2 py-1.5 text-xs ${
+                    rightPaneMode === "extract"
+                      ? "bg-indigo-700 text-white"
+                      : "bg-neutral-800 text-neutral-300"
+                  }`}
+                >
+                  Extract
+                </button>
+                <button
+                  onClick={() => setRightPaneMode("form-template-edit")}
+                  className={`rounded-md px-2 py-1.5 text-xs ${
+                    rightPaneMode === "form-template-edit"
+                      ? "bg-indigo-700 text-white"
+                      : "bg-neutral-800 text-neutral-300"
+                  }`}
+                >
+                  Form Template Edit
+                </button>
               </div>
 
               <div className="flex-1 overflow-auto pr-2 custom-scrollbar space-y-6">
@@ -1061,11 +1262,11 @@ export default function DocumentVisualizer() {
                           onClick={() => void handleCreateTemplateAndSave()}
                           className="w-full rounded-md bg-amber-700 hover:bg-amber-600 px-3 py-2 text-sm"
                         >
-                          Create New Template (Pro) + Save to Library
+                          Create New Template (Pro)
                         </button>
                       </div>
                     )}
-                    {template && (
+                    {template && rightPaneMode !== "extract" && (
                       <div className="grid grid-cols-2 gap-2">
                         <button
                           onClick={() => void runExtraction(template, documentText, pages)}
@@ -1077,11 +1278,11 @@ export default function DocumentVisualizer() {
                           onClick={() => void handleSaveCurrentTemplate()}
                           className="rounded-md bg-emerald-700 hover:bg-emerald-600 px-3 py-2 text-sm"
                         >
-                          Save Template Changes
+                          Save To Library
                         </button>
                       </div>
                     )}
-                    {template && (
+                    {template && rightPaneMode === "field-edit" && (
                       <div>
                         <h3 className="text-sm uppercase tracking-wide text-neutral-400 mb-3">
                           Extracted Template Fields ({template.fields.length})
@@ -1113,6 +1314,9 @@ export default function DocumentVisualizer() {
                               <div className="mt-1 text-[11px] text-neutral-500">
                                 display: {field.displayType ?? "Text"}
                               </div>
+                              <div className="mt-1 text-[11px] text-neutral-500">
+                                key: {field.key ?? toJsonKey(field.label)}
+                              </div>
                               {field.bbox && (
                                 <div className="mt-1 text-[11px] text-neutral-500">
                                   box x:{field.bbox.x}, y:{field.bbox.y}, w:{field.bbox.width}, h:{field.bbox.height}
@@ -1128,7 +1332,7 @@ export default function DocumentVisualizer() {
                         </div>
                       </div>
                     )}
-                    {template && (
+                    {template && rightPaneMode === "field-edit" && (
                       <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 space-y-2">
                         <div className="flex items-center justify-between">
                           <h4 className="text-xs uppercase tracking-wide text-neutral-400">Template JSON</h4>
@@ -1145,7 +1349,10 @@ export default function DocumentVisualizer() {
                       </div>
                     )}
 
-                    {template && selectedFieldIndex !== null && template.fields[selectedFieldIndex] && (
+                    {template &&
+                      rightPaneMode === "field-edit" &&
+                      selectedFieldIndex !== null &&
+                      template.fields[selectedFieldIndex] && (
                       <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 space-y-3">
                         <h4 className="text-xs uppercase tracking-wide text-neutral-400">
                           Selected Field Editor
@@ -1158,6 +1365,23 @@ export default function DocumentVisualizer() {
                               updateTemplateField(selectedFieldIndex, (field) => ({
                                 ...field,
                                 label: e.target.value,
+                                key:
+                                  field.key && field.key.length > 0
+                                    ? field.key
+                                    : toJsonKey(e.target.value),
+                              }))
+                            }
+                            className="w-full rounded-md border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm"
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <label className="block text-xs text-neutral-400">Key (JSON variable)</label>
+                          <input
+                            value={template.fields[selectedFieldIndex].key ?? ""}
+                            onChange={(e) =>
+                              updateTemplateField(selectedFieldIndex, (field) => ({
+                                ...field,
+                                key: toJsonKey(e.target.value),
                               }))
                             }
                             className="w-full rounded-md border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm"
@@ -1210,15 +1434,31 @@ export default function DocumentVisualizer() {
                       </div>
                     )}
 
-                    <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 space-y-3">
+                    {rightPaneMode === "field-edit" && (
+                      <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 space-y-3">
                       <h4 className="text-xs uppercase tracking-wide text-neutral-400">Add Field + Draw Box</h4>
                       <div className="space-y-2">
                         <label className="block text-xs text-neutral-400">Label</label>
                         <input
                           value={newFieldLabel}
-                          onChange={(e) => setNewFieldLabel(e.target.value)}
+                          onChange={(e) => {
+                            const next = e.target.value;
+                            setNewFieldLabel(next);
+                            if (!newFieldKey.trim()) {
+                              setNewFieldKey(toJsonKey(next));
+                            }
+                          }}
                           className="w-full rounded-md border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm"
                           placeholder="e.g. Applicant Signature"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <label className="block text-xs text-neutral-400">Key (JSON variable)</label>
+                        <input
+                          value={newFieldKey}
+                          onChange={(e) => setNewFieldKey(toJsonKey(e.target.value))}
+                          className="w-full rounded-md border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-sm"
+                          placeholder="e.g. agent_date"
                         />
                       </div>
                       <div className="space-y-2">
@@ -1256,9 +1496,10 @@ export default function DocumentVisualizer() {
                       >
                         Add Field Then Draw Box On PDF
                       </button>
-                    </div>
+                      </div>
+                    )}
 
-                    {drawTarget.mode !== "none" && (
+                    {rightPaneMode === "field-edit" && drawTarget.mode !== "none" && (
                       <div className="rounded-md border border-amber-600 bg-amber-900/20 px-3 py-2 text-xs text-amber-200">
                         Drawing mode active. Drag on a page to place the box.
                         <button
@@ -1273,7 +1514,7 @@ export default function DocumentVisualizer() {
                       </div>
                     )}
 
-                    {analysis && (
+                    {rightPaneMode === "extract" && analysis && (
                       <div className="prose prose-invert prose-p:text-neutral-300 max-w-none">
                         <ReactMarkdown
                           components={{
@@ -1296,6 +1537,7 @@ export default function DocumentVisualizer() {
                       </div>
                     )}
 
+                    {rightPaneMode === "extract" && (
                     <div className="border-t border-neutral-800 pt-4">
                       <div className="flex items-center justify-between mb-2">
                         <h3 className="text-sm uppercase tracking-wide text-neutral-400">Chat</h3>
@@ -1354,6 +1596,111 @@ export default function DocumentVisualizer() {
                         </button>
                       </div>
                     </div>
+                    )}
+
+                    {rightPaneMode === "form-template-edit" && template && (
+                      <div className="space-y-4">
+                        <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 space-y-2">
+                          <h4 className="text-xs uppercase tracking-wide text-neutral-400">
+                            Form Template Blocks ({template.templateContent?.staticBlocks?.length ?? 0})
+                          </h4>
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => addHoveredTextAsStaticBlock("Page Header")}
+                              className="rounded bg-indigo-700 hover:bg-indigo-600 px-2 py-1 text-xs"
+                              disabled={!hoveredItem}
+                            >
+                              Insert Page Header
+                            </button>
+                            <button
+                              onClick={() => addHoveredTextAsStaticBlock("Section Header")}
+                              className="rounded bg-indigo-700 hover:bg-indigo-600 px-2 py-1 text-xs"
+                              disabled={!hoveredItem}
+                            >
+                              Insert Section Header
+                            </button>
+                          </div>
+                          <div className="max-h-44 overflow-auto space-y-2">
+                            {(template.templateContent?.staticBlocks ?? []).map((block, idx) => (
+                              <div key={`${block.key}-${idx}`} className="border border-neutral-800 rounded p-2 space-y-1">
+                                <div className="text-[11px] text-neutral-400">p{block.page}</div>
+                                <input
+                                  value={block.key}
+                                  onChange={(e) =>
+                                    setTemplate((prev) => {
+                                      if (!prev) return prev;
+                                      const blocks = [...(prev.templateContent?.staticBlocks ?? [])];
+                                      blocks[idx] = { ...blocks[idx], key: toJsonKey(e.target.value) };
+                                      return { ...prev, templateContent: { staticBlocks: blocks } };
+                                    })
+                                  }
+                                  className="w-full rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs"
+                                />
+                                <select
+                                  value={block.displayType}
+                                  onChange={(e) =>
+                                    setTemplate((prev) => {
+                                      if (!prev) return prev;
+                                      const blocks = [...(prev.templateContent?.staticBlocks ?? [])];
+                                      blocks[idx] = {
+                                        ...blocks[idx],
+                                        displayType: e.target.value as TemplateStaticBlock["displayType"],
+                                      };
+                                      return { ...prev, templateContent: { staticBlocks: blocks } };
+                                    })
+                                  }
+                                  className="w-full rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs"
+                                >
+                                  <option value="Page Header">Page Header</option>
+                                  <option value="Section Header">Section Header</option>
+                                  <option value="Text">Text</option>
+                                </select>
+                                <textarea
+                                  value={block.text}
+                                  onChange={(e) =>
+                                    setTemplate((prev) => {
+                                      if (!prev) return prev;
+                                      const blocks = [...(prev.templateContent?.staticBlocks ?? [])];
+                                      blocks[idx] = { ...blocks[idx], text: e.target.value };
+                                      return { ...prev, templateContent: { staticBlocks: blocks } };
+                                    })
+                                  }
+                                  className="w-full rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs min-h-16"
+                                />
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+
+                        <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 space-y-2">
+                          <h4 className="text-xs uppercase tracking-wide text-neutral-400">Field Value Input Test</h4>
+                          <div className="max-h-40 overflow-auto space-y-2">
+                            {template.fields.map((field, idx) => {
+                              const key = field.key ?? toJsonKey(field.label || `field_${idx + 1}`);
+                              return (
+                                <div key={key} className="space-y-1">
+                                  <label className="text-[11px] text-neutral-400">{key}</label>
+                                  <input
+                                    value={testValues[key] ?? ""}
+                                    onChange={(e) =>
+                                      setTestValues((prev) => ({ ...prev, [key]: e.target.value }))
+                                    }
+                                    className="w-full rounded border border-neutral-700 bg-neutral-950 px-2 py-1 text-xs"
+                                  />
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+
+                        <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 space-y-2">
+                          <h4 className="text-xs uppercase tracking-wide text-neutral-400">Merged Preview</h4>
+                          <pre className="max-h-40 overflow-auto rounded border border-neutral-800 bg-neutral-950 p-2 text-[11px] text-neutral-300 whitespace-pre-wrap">
+                            {mergedFormPreview.join("\n\n")}
+                          </pre>
+                        </div>
+                      </div>
+                    )}
                   </>
                 )}
               </div>

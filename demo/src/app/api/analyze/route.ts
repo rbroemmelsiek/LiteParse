@@ -74,6 +74,7 @@ type DisplayType =
   | "File"
   | "Video (Url)"
   | "Page Header"
+  | "Section Header"
   | "ChangeCounter"
   | "ChangeLocation"
   | "ChangeTimestamp"
@@ -81,6 +82,7 @@ type DisplayType =
   | "App";
 
 interface TemplateField {
+  key?: string;
   label: string;
   type: FieldType;
   displayType?: DisplayType;
@@ -97,9 +99,19 @@ interface TemplateField {
   };
 }
 
+interface TemplateStaticBlock {
+  key: string;
+  displayType: "Page Header" | "Section Header" | "Text";
+  page: number;
+  text: string;
+}
+
 interface TemplateDefinition {
   templateName: string;
   fields: TemplateField[];
+  templateContent?: {
+    staticBlocks: TemplateStaticBlock[];
+  };
   notes: string[];
 }
 
@@ -113,6 +125,8 @@ interface AnalyzeRequestBody {
   text?: string;
   pages?: LiteParsePage[];
   template?: TemplateDefinition;
+  libraryId?: string;
+  templateSignature?: string;
   messages?: ChatMessage[];
   message?: string;
   includeImages?: boolean;
@@ -204,6 +218,48 @@ function parseTemplateJson(raw: string): TemplateDefinition | null {
   }
 }
 
+function toJsonKey(label: string): string {
+  const key = label
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return key || "field";
+}
+
+function normalizeTemplate(template: TemplateDefinition): TemplateDefinition {
+  return {
+    ...template,
+    fields: template.fields.map((field, idx) => ({
+      ...field,
+      key: field.key && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(field.key) ? field.key : toJsonKey(field.label || `field_${idx + 1}`),
+      displayType: field.displayType ?? "Text",
+    })),
+    templateContent: {
+      staticBlocks: (template.templateContent?.staticBlocks ?? []).map((block, idx) => ({
+        key:
+          block.key && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(block.key)
+            ? block.key
+            : `static_${idx + 1}`,
+        displayType: block.displayType,
+        page: block.page,
+        text: block.text,
+      })),
+    },
+  };
+}
+
+function extractJsonObject(raw: string): Record<string, unknown> | null {
+  const trimmed = raw.trim();
+  const fenced = trimmed.match(/```json\s*([\s\S]*?)\s*```/i);
+  const jsonString = fenced?.[1] ?? trimmed;
+  try {
+    return JSON.parse(jsonString) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 async function generateWithFallback(
   genAI: GoogleGenerativeAI,
   models: string[],
@@ -252,6 +308,7 @@ Return STRICT JSON only, no markdown, no extra prose:
   "templateName": "string",
   "fields": [
     {
+      "key": "json_compatible_snake_case_identifier",
       "label": "string",
       "type": "one_of_allowed_types",
       "displayType": "one_of_allowed_display_types",
@@ -263,6 +320,16 @@ Return STRICT JSON only, no markdown, no extra prose:
       "bbox": { "x": 0, "y": 0, "width": 0, "height": 0 }
     }
   ],
+  "templateContent": {
+    "staticBlocks": [
+      {
+        "key": "json_compatible_snake_case_identifier",
+        "displayType": "Page Header|Section Header|Text",
+        "page": 1,
+        "text": "string"
+      }
+    ]
+  },
   "notes": ["string"]
 }
 
@@ -272,6 +339,50 @@ ${plainText}
 """
 
 LiteParse structured pages JSON (truncated sample):
+\`\`\`json
+${structuredExcerpt}
+\`\`\`
+`;
+}
+
+function buildExtractPrompt(
+  plainText: string,
+  structuredExcerpt: string,
+  template: TemplateDefinition | undefined,
+  libraryId: string | undefined,
+  templateSignature: string | undefined,
+): string {
+  const templateJson = template ? JSON.stringify(template, null, 2) : "No template available.";
+  return `Extract a Form Instance from LiteParse output using the provided Template.
+
+Rules:
+- Use template.fields[*].key as JSON output keys.
+- Preserve data types conceptually based on field displayType/type.
+- Return null where value is not confidently present.
+- Do not invent values.
+
+Return STRICT JSON ONLY:
+{
+  "templateRef": {
+    "libraryId": "${libraryId ?? ""}",
+    "templateSignature": "${templateSignature ?? ""}"
+  },
+  "values": {
+    "<field_key>": "<value_or_null>"
+  }
+}
+
+Template JSON:
+\`\`\`json
+${templateJson}
+\`\`\`
+
+LiteParse plain text:
+"""
+${plainText}
+"""
+
+LiteParse structured pages JSON excerpt:
 \`\`\`json
 ${structuredExcerpt}
 \`\`\`
@@ -329,6 +440,8 @@ export async function POST(req: NextRequest) {
       text,
       pages,
       template,
+      libraryId,
+      templateSignature,
       messages = [],
       message,
       includeImages = true,
@@ -372,14 +485,19 @@ export async function POST(req: NextRequest) {
     }
 
     if (mode === "extract") {
-      const prompt = buildChatPrompt(
+      const normalizedTemplate = template ? normalizeTemplate(template) : undefined;
+      const prompt = buildExtractPrompt(
         plainText,
         structuredExcerpt,
-        template,
-        [],
-        "Extract values for all template fields from the provided document context.",
+        normalizedTemplate,
+        libraryId,
+        templateSignature,
       );
       const { text: aiText, model } = await generateWithFallback(genAI, uniqueModels, [{ text: prompt }]);
+      const parsed = extractJsonObject(aiText);
+      if (parsed) {
+        return NextResponse.json({ instance: parsed, extraction: aiText, model });
+      }
       return NextResponse.json({ extraction: aiText, model });
     }
 
@@ -406,10 +524,11 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    const normalizedTemplate = normalizeTemplate(parsedTemplate);
     return NextResponse.json({
       model,
-      template: parsedTemplate,
-      analysis: `Identified **${parsedTemplate.fields.length}** template field(s).`,
+      template: normalizedTemplate,
+      analysis: `Identified **${normalizedTemplate.fields.length}** template field(s).`,
     });
   } catch (error) {
     console.error("Analyze API error:", error);
